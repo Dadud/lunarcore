@@ -1,5 +1,7 @@
 mod crypto;
 mod rng;
+mod sx1262_subghz;
+mod power;
 mod radio;
 mod sx1262;
 #[cfg(feature = "sx1276")]
