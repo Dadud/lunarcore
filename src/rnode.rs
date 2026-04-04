@@ -1,5 +1,6 @@
 use heapless::Vec;
 use crate::crypto::sha256::Sha256;
+use crate::rnode_frame::{LinkQuality, RNodeFrame, FLAG_MAC, FLAG_RX};
 
 
 pub const FEND: u8 = 0xC0;
@@ -411,6 +412,8 @@ pub enum RNodeState {
 #[derive(Debug, Clone)]
 pub struct RNodeConfig {
 
+    pub frequency_mhz: f64,
+
     pub frequency: u32,
 
     pub bandwidth: u32,
@@ -435,6 +438,7 @@ pub struct RNodeConfig {
 impl Default for RNodeConfig {
     fn default() -> Self {
         Self {
+            frequency_mhz: 868.1,
             frequency: 868_100_000,
             bandwidth: 125_000,
             tx_power: 14,
@@ -453,6 +457,7 @@ impl RNodeConfig {
 
     pub fn eu868() -> Self {
         Self {
+            frequency_mhz: 868.1,
             frequency: 868_100_000,
             ..Default::default()
         }
@@ -461,6 +466,7 @@ impl RNodeConfig {
 
     pub fn us915() -> Self {
         Self {
+            frequency_mhz: 915.0,
             frequency: 915_000_000,
             ..Default::default()
         }
@@ -715,6 +721,7 @@ impl RNodeHandler {
                     self.config.frequency = u32::from_be_bytes([
                         frame.data[0], frame.data[1], frame.data[2], frame.data[3]
                     ]);
+                    self.config.frequency_mhz = self.config.frequency as f64 / 1_000_000.0;
                 }
 
                 KissFrame::command_frame(RNodeCommand::Frequency, &self.config.frequency.to_be_bytes())
@@ -989,17 +996,12 @@ impl RNodeHandler {
         self.stats.last_rssi = rssi;
         self.stats.last_snr = snr;
 
+        let packet = RNodeFrame::new(FLAG_RX | FLAG_MAC, 0, data, LinkQuality { rssi_dbm: rssi, snr_db: snr })
+            .unwrap_or_else(|| RNodeFrame::new(FLAG_RX, 0, &data[..data.len().min(32)], LinkQuality { rssi_dbm: rssi, snr_db: snr }).unwrap());
 
+        let encoded_packet = packet.encode();
         let mut frame = KissFrame::new(RNodeCommand::DataRssi as u8);
-        for &b in data {
-            let _ = frame.data.push(b);
-        }
-
-        let rssi_bytes = rssi.to_be_bytes();
-        let _ = frame.data.push(rssi_bytes[0]);
-        let _ = frame.data.push(rssi_bytes[1]);
-        let _ = frame.data.push(snr as u8);
-
+        let _ = frame.data.extend_from_slice(&encoded_packet);
         frame
     }
 

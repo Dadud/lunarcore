@@ -1,6 +1,7 @@
 use embedded_hal::spi::SpiDevice;
 use embedded_hal::digital::{InputPin, OutputPin};
 use esp_idf_hal::delay::FreeRtos;
+use crate::radio::{ModemConfig, Packet, Radio};
 
 #[inline]
 fn max_supported_tx_power() -> i8 {
@@ -154,6 +155,33 @@ impl Default for RadioConfig {
     }
 }
 
+impl From<ModemConfig> for RadioConfig {
+    fn from(config: ModemConfig) -> Self {
+        let bandwidth = match config.bandwidth_hz {
+            0..=10_000 => 0x00,
+            10_001..=20_000 => 0x01,
+            20_001..=40_000 => 0x02,
+            40_001..=80_000 => 0x03,
+            80_001..=187_500 => 0x04,
+            187_501..=375_000 => 0x05,
+            _ => 0x06,
+        };
+
+        Self {
+            frequency: config.frequency_hz,
+            spreading_factor: config.spreading_factor,
+            bandwidth,
+            coding_rate: config.coding_rate.saturating_sub(4),
+            tx_power: config.tx_power_dbm,
+            sync_word: config.sync_word,
+            preamble_length: config.preamble_length,
+            crc_enabled: config.crc_enabled,
+            implicit_header: config.implicit_header,
+            ldro: config.low_data_rate_optimize,
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RadioState {
@@ -165,23 +193,7 @@ pub enum RadioState {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RadioError {
-
-    Spi,
-
-    BusyTimeout,
-
-    InvalidConfig,
-
-    TxTimeout,
-
-    RxTimeout,
-
-    CrcError,
-
-    BufferOverflow,
-}
+pub type RadioError = crate::radio::RadioError;
 
 
 pub struct Sx1262<SPI, NSS, RESET, BUSY, DIO1> {
@@ -791,5 +803,45 @@ where
         }
 
         Ok(random)
+    }
+}
+
+
+impl<SPI, NSS, RESET, BUSY, DIO1, E> Radio for Sx1262<SPI, NSS, RESET, BUSY, DIO1>
+where
+    SPI: SpiDevice<Error = E>,
+    NSS: OutputPin,
+    RESET: OutputPin,
+    BUSY: InputPin,
+    DIO1: InputPin,
+{
+    fn init(&mut self) -> Result<(), RadioError> {
+        Sx1262::init(self)
+    }
+
+    fn set_frequency(&mut self, freq_hz: u32) -> Result<(), RadioError> {
+        let mut config = self.config.clone();
+        config.frequency = freq_hz;
+        self.configure(&config)
+    }
+
+    fn set_tx_power(&mut self, power_dbm: i8) -> Result<(), RadioError> {
+        let mut config = self.config.clone();
+        config.tx_power = power_dbm;
+        self.configure(&config)
+    }
+
+    fn send(&mut self, data: &[u8]) -> Result<(), RadioError> {
+        self.transmit(data)
+    }
+
+    fn receive(&mut self, timeout_ms: u32) -> Result<Packet, RadioError> {
+        self.start_rx(timeout_ms)?;
+        let (payload, rssi, snr) = self.read_packet()?;
+        Ok(Packet { payload, rssi, snr })
+    }
+
+    fn set_modem(&mut self, config: ModemConfig) -> Result<(), RadioError> {
+        self.configure(&RadioConfig::from(config))
     }
 }
