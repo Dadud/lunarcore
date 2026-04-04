@@ -26,6 +26,8 @@ embuild = "0.33"
 default = ["ble"]
 ble = []
 v4 = []
+nrf52 = []
+stm32wl = []
 meshtastic = []
 rnode = []
 

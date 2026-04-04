@@ -1,6 +1,7 @@
 mod crypto;
 mod rng;
 mod sx1262;
+mod sx1262_subghz;
 mod protocol;
 mod protocol_router;
 mod meshtastic;
@@ -10,6 +11,7 @@ mod display;
 mod transport;
 mod session;
 mod onion;
+mod power;
 
 
 use esp_idf_hal::delay::FreeRtos;
@@ -2011,6 +2013,8 @@ fn main() -> ! {
 
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    let _ = usb::init_usb_runtime();
+    let _ = usb::usb_log_transport();
 
     run_lunarcore();
 }
@@ -2022,6 +2026,7 @@ fn run_lunarcore() -> ! {
     let identity = NodeIdentity::from_hardware();
     log::info!("[INIT] Node ID: {:08X}", identity.node_id);
     log::info!("[INIT] Board profile: {} (max TX {} dBm)", board_variant(), max_tx_power_dbm());
+    log::info!("[INIT] Detected board: {:?}", detect_board());
 
 
     let peripherals = Peripherals::take().unwrap();
