@@ -23,13 +23,16 @@ log = "0.4"
 embuild = "0.33"
 
 [features]
-default = ["ble"]
+default = ["ble", "sx1262"]
 ble = []
 v4 = []
 nrf52 = []
 stm32wl = []
 meshtastic = []
 rnode = []
+sx1262 = []
+sx1276 = []
+sx1280 = []
 
 [profile.release]
 opt-level = "s"
