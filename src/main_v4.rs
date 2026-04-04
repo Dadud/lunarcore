@@ -1,9 +1,17 @@
 mod crypto;
 mod rng;
+mod radio;
 mod sx1262;
+#[cfg(feature = "sx1276")]
+mod sx1276;
+#[cfg(feature = "sx1280")]
+mod sx1280;
+#[cfg(feature = "stm32wl")]
+mod subghz;
 mod protocol;
 mod protocol_router;
 mod meshtastic;
+mod rnode_frame;
 mod rnode;
 mod ble;
 mod display;
@@ -2011,6 +2019,7 @@ fn main() -> ! {
 
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    let _ = usb::init_usb_runtime();
 
     run_lunarcore();
 }
@@ -2022,6 +2031,7 @@ fn run_lunarcore() -> ! {
     let identity = NodeIdentity::from_hardware();
     log::info!("[INIT] Node ID: {:08X}", identity.node_id);
     log::info!("[INIT] Board profile: {} (max TX {} dBm)", board_variant(), max_tx_power_dbm());
+    log::info!("[INIT] Detected board: {:?}", detect_board());
 
 
     let peripherals = Peripherals::take().unwrap();
