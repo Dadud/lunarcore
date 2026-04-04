@@ -25,6 +25,7 @@ embuild = "0.33"
 [features]
 default = ["ble"]
 ble = []
+v4 = []
 meshtastic = []
 rnode = []
 

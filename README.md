@@ -23,6 +23,17 @@ pip install esptool
 esptool.py --chip esp32s3 -p PORT write_flash 0x0 lunarcore-esp32s3.bin
 ```
 
+
+## Heltec WiFi LoRa 32 V4
+
+Also supported. Build with:
+```bash
+cargo build --release --features v4
+espflash flash target/xtensa-esp32s3-espidf/release/lunarcore --monitor
+```
+
+TX power: 28 dBm max (vs 22 dBm on V3). All other specs identical.
+
 ## Build from source
 
 ```bash

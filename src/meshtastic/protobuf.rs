@@ -718,6 +718,7 @@ pub fn decode_user(data: &[u8]) -> Option<User> {
                     9 => HardwareModel::Rak4631,
                     10 => HardwareModel::HeltecV2_1,
                     34 => HardwareModel::HeltecWifiLoraV3,
+                    35 => HardwareModel::HeltecWifiLoraV4,
                     255 => HardwareModel::PrivateHw,
                     _ => HardwareModel::Unset,
                 };

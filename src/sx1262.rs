@@ -2,6 +2,20 @@ use embedded_hal::spi::SpiDevice;
 use embedded_hal::digital::{InputPin, OutputPin};
 use esp_idf_hal::delay::FreeRtos;
 
+#[inline]
+fn max_supported_tx_power() -> i8 {
+    #[cfg(feature = "v4")]
+    {
+        28
+    }
+
+    #[cfg(not(feature = "v4"))]
+    {
+        22
+    }
+}
+
+
 
 #[allow(dead_code)]
 mod opcode {
@@ -374,7 +388,7 @@ where
         ])?;
 
 
-        let power = config.tx_power.max(-9).min(22) as u8;
+        let power = config.tx_power.max(-9).min(max_supported_tx_power()) as u8;
         self.write_command(&[
             opcode::SET_TX_PARAMS,
             power.wrapping_add(9),
