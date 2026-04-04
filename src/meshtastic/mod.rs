@@ -389,6 +389,11 @@ pub enum HardwareModel {
     Ms24Sf1 = 83,
     TloraC6 = 84,
     WisMeshTap = 85,
+    RNodeV1 = 86,
+    RNodeV2 = 87,
+    AdafruitFeatherEsp32LoRa = 88,
+    GenericEsp32LoRa = 89,
+    SeeedStudioLoRaRadio = 90,
     PrivateHw = 255,
 }
 

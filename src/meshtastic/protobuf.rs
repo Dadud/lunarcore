@@ -796,6 +796,11 @@ pub fn decode_user(data: &[u8]) -> Option<User> {
                     83 => HardwareModel::Ms24Sf1,
                     84 => HardwareModel::TloraC6,
                     85 => HardwareModel::WisMeshTap,
+                    86 => HardwareModel::RNodeV1,
+                    87 => HardwareModel::RNodeV2,
+                    88 => HardwareModel::AdafruitFeatherEsp32LoRa,
+                    89 => HardwareModel::GenericEsp32LoRa,
+                    90 => HardwareModel::SeeedStudioLoRaRadio,
                     255 => HardwareModel::PrivateHw,
                     _ => HardwareModel::Unset,
                 };
