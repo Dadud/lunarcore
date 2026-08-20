@@ -23,7 +23,7 @@ pub const LORA_HEADER_SIZE: usize = 16;
 pub const MAX_LORA_PAYLOAD: usize = 237;
 
 
-pub const MIC_SIZE: usize = 4;
+pub const MIC_SIZE: usize = 0;
 
 
 pub const DEFAULT_HOP_LIMIT: u8 = 3;
@@ -101,7 +101,15 @@ pub struct MeshPacket {
 
     pub hop_limit: u8,
 
+    pub hop_start: u8,
+
     pub want_ack: bool,
+
+    pub via_mqtt: bool,
+
+    pub next_hop: u8,
+
+    pub relay_node: u8,
 
     pub priority: Priority,
 
@@ -179,7 +187,11 @@ impl Default for MeshPacket {
             channel_hash: 0,
             id: 0,
             hop_limit: DEFAULT_HOP_LIMIT,
+            hop_start: DEFAULT_HOP_LIMIT,
             want_ack: false,
+            via_mqtt: false,
+            next_hop: 0,
+            relay_node: 0,
             priority: Priority::Default,
             rx_time: 0,
             rx_snr: 0.0,
@@ -413,7 +425,7 @@ impl MeshtasticHandler {
 
 
     pub fn process_lora_packet(&mut self, data: &[u8], rssi: i32, snr: f32) -> Option<MeshPacket> {
-        if data.len() < LORA_HEADER_SIZE + MIC_SIZE {
+        if data.len() < LORA_HEADER_SIZE {
             return None;
         }
 
@@ -433,20 +445,24 @@ impl MeshtasticHandler {
     }
 
 
+    fn find_channel_by_hash(&self, hash: u8) -> Option<&Channel> {
+        if self.primary_channel.hash() == hash {
+            return Some(&self.primary_channel);
+        }
+        for ch in self.secondary_channels.iter().flatten() {
+            if ch.hash() == hash {
+                return Some(ch);
+            }
+        }
+        None
+    }
+
+
     fn decrypt_packet(&self, packet: &MeshPacket) -> Option<MeshPacket> {
         let mut result = packet.clone();
 
         if let PacketPayload::Encrypted(ref encrypted) = packet.payload {
-
-            let channel = if packet.channel == 0 {
-                &self.primary_channel
-            } else {
-                self.secondary_channels
-                    .get((packet.channel - 1) as usize)?
-                    .as_ref()?
-            };
-
-
+            let channel = self.find_channel_by_hash(packet.channel_hash)?;
             let decrypted = channel.decrypt(packet.id, packet.from, encrypted)?;
 
 
@@ -491,10 +507,13 @@ impl MeshtasticHandler {
             self.node_id,
             to,
             packet_id,
-            0,
             channel_hash,
             DEFAULT_HOP_LIMIT,
+            DEFAULT_HOP_LIMIT,
             want_ack,
+            false,
+            0,
+            0,
             &encrypted,
         )?;
 

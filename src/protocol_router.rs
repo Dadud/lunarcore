@@ -454,15 +454,11 @@ impl LoRaPacket {
         }
 
 
-        if data.len() >= 20 {
-
-
-            let channel_hash = data[3];
-
-            if data.len() >= 12 {
-                let flags = data[11];
-                let hop_limit = flags & 0x07;
-                if hop_limit >= 1 && hop_limit <= 7 && channel_hash != 0 {
+        if data.len() >= 16 {
+            let from = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            if from != 0 {
+                let flags = data[12];
+                if (flags & 0x07) <= 7 {
                     return Protocol::Meshtastic;
                 }
             }

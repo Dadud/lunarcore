@@ -1,4 +1,5 @@
 pub mod aes;
+pub mod aes_ccm;
 pub mod sha256;
 pub mod hmac;
 pub mod x25519;
@@ -115,17 +116,9 @@ mod tests {
 
     #[test]
     fn test_aes128_drop_zeros_keys() {
-
         let key = [0x42u8; 16];
         let cipher = Aes128::new(&key);
-
-
-        let round_keys_ptr = &cipher.round_keys as *const [u8; 176];
-
-
         drop(cipher);
-
-
     }
 
     #[test]

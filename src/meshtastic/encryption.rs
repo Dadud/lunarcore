@@ -4,6 +4,7 @@ use crate::crypto::sha256::Sha256;
 use crate::crypto::hmac::HmacSha256;
 use crate::crypto::hkdf::meshtastic as mesh_kdf;
 use super::channel::ChannelKey;
+use super::channel::xor_bytes;
 
 
 pub const MAX_PAYLOAD_SIZE: usize = 237;
@@ -119,15 +120,7 @@ impl EncryptionContext {
 
     pub fn key_hash(&self) -> u8 {
         let key_bytes = self.key.as_bytes();
-        if key_bytes.is_empty() {
-            return 0;
-        }
-
-        let mut h: u8 = 0;
-        for &b in key_bytes {
-            h ^= b;
-        }
-        h
+        xor_bytes(key_bytes)
     }
 }
 
@@ -211,91 +204,105 @@ impl Default for MicMode {
 
 
 use crate::crypto::x25519;
-use crate::crypto::chacha20::ChaCha20;
-use crate::crypto::poly1305::ChaCha20Poly1305;
+use crate::crypto::aes_ccm;
 use crate::crypto::hkdf::Hkdf;
 
 
-pub const PKI_OVERHEAD: usize = 32 + 16;
+pub const PKI_OVERHEAD: usize = 12;
+
+pub const PKI_TAG_SIZE: usize = 8;
+
+pub const PKI_EXTRA_NONCE_SIZE: usize = 4;
+
+
+pub fn init_pki_nonce(packet_id: u32, from_node: u32, extra_nonce: u32) -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    nonce[..4].copy_from_slice(&packet_id.to_le_bytes());
+    nonce[4..8].copy_from_slice(&extra_nonce.to_le_bytes());
+    nonce[8..12].copy_from_slice(&from_node.to_le_bytes());
+    nonce
+}
 
 
 pub fn pki_encrypt(
     recipient_pubkey: &[u8; 32],
     sender_privkey: &[u8; 32],
     plaintext: &[u8],
-    nonce: &[u8; 12],
+    packet_id: u32,
+    from_node: u32,
+    extra_nonce: u32,
 ) -> Option<Vec<u8, 256>> {
     if plaintext.len() + PKI_OVERHEAD > 256 {
         return None;
     }
 
-
-    let mut ephemeral_seed = [0u8; 32];
-    Hkdf::derive(nonce, sender_privkey, b"ephemeral", &mut ephemeral_seed);
-
-
-    let ephemeral_pubkey = x25519::x25519_base(&ephemeral_seed);
-
-
-    let shared_secret = x25519::x25519(&ephemeral_seed, recipient_pubkey);
-
-
-    let mut key = [0u8; 32];
-    Hkdf::derive(b"meshtastic-pki", &shared_secret, &ephemeral_pubkey, &mut key);
-
+    let shared = x25519::x25519(sender_privkey, recipient_pubkey);
+    let session_key = Sha256::hash(&shared);
+    let nonce = init_pki_nonce(packet_id, from_node, extra_nonce);
 
     let mut ciphertext = [0u8; 240];
-    let mut tag = [0u8; 16];
-
+    let mut tag = [0u8; PKI_TAG_SIZE];
     if plaintext.len() > ciphertext.len() {
         return None;
     }
 
-
-    ChaCha20Poly1305::seal(&key, nonce, &[], plaintext, &mut ciphertext[..plaintext.len()], &mut tag);
-
+    if !aes_ccm::aes_ccm_encrypt(
+        &session_key,
+        &nonce[..13],
+        PKI_TAG_SIZE,
+        plaintext,
+        &mut ciphertext[..plaintext.len()],
+        &mut tag,
+    ) {
+        return None;
+    }
 
     let mut output = Vec::new();
-    output.extend_from_slice(&ephemeral_pubkey).ok()?;
     output.extend_from_slice(&ciphertext[..plaintext.len()]).ok()?;
     output.extend_from_slice(&tag).ok()?;
-
+    output.extend_from_slice(&extra_nonce.to_le_bytes()).ok()?;
     Some(output)
 }
 
 
 pub fn pki_decrypt(
     recipient_privkey: &[u8; 32],
+    sender_pubkey: &[u8; 32],
     encrypted: &[u8],
-    nonce: &[u8; 12],
+    packet_id: u32,
+    from_node: u32,
 ) -> Option<Vec<u8, 240>> {
     if encrypted.len() < PKI_OVERHEAD {
         return None;
     }
 
+    let ciphertext_len = encrypted.len() - PKI_OVERHEAD;
+    let ciphertext = &encrypted[..ciphertext_len];
+    let tag = &encrypted[ciphertext_len..ciphertext_len + PKI_TAG_SIZE];
+    let extra_nonce = u32::from_le_bytes([
+        encrypted[ciphertext_len + PKI_TAG_SIZE],
+        encrypted[ciphertext_len + PKI_TAG_SIZE + 1],
+        encrypted[ciphertext_len + PKI_TAG_SIZE + 2],
+        encrypted[ciphertext_len + PKI_TAG_SIZE + 3],
+    ]);
 
-    let mut ephemeral_pubkey = [0u8; 32];
-    ephemeral_pubkey.copy_from_slice(&encrypted[..32]);
-
-
-    let ciphertext = &encrypted[32..encrypted.len() - 16];
-    let mut tag = [0u8; 16];
-    tag.copy_from_slice(&encrypted[encrypted.len() - 16..]);
-
-
-    let shared_secret = x25519::x25519(recipient_privkey, &ephemeral_pubkey);
-
-
-    let mut key = [0u8; 32];
-    Hkdf::derive(b"meshtastic-pki", &shared_secret, &ephemeral_pubkey, &mut key);
-
+    let shared = x25519::x25519(recipient_privkey, sender_pubkey);
+    let session_key = Sha256::hash(&shared);
+    let nonce = init_pki_nonce(packet_id, from_node, extra_nonce);
 
     let mut plaintext = [0u8; 240];
     if ciphertext.len() > plaintext.len() {
         return None;
     }
 
-    if !ChaCha20Poly1305::open(&key, nonce, &[], ciphertext, &tag, &mut plaintext[..ciphertext.len()]) {
+    if !aes_ccm::aes_ccm_decrypt(
+        &session_key,
+        &nonce[..13],
+        PKI_TAG_SIZE,
+        ciphertext,
+        &mut plaintext,
+        tag,
+    ) {
         return None;
     }
 
@@ -377,20 +384,24 @@ impl KeyStore {
         &self,
         recipient_pubkey: &[u8; 32],
         plaintext: &[u8],
-        nonce: &[u8; 12],
+        packet_id: u32,
+        from_node: u32,
+        extra_nonce: u32,
     ) -> Option<Vec<u8, 256>> {
         let privkey = self.node_privkey.as_ref()?;
-        pki_encrypt(recipient_pubkey, privkey, plaintext, nonce)
+        pki_encrypt(recipient_pubkey, privkey, plaintext, packet_id, from_node, extra_nonce)
     }
 
 
     pub fn decrypt_from_node(
         &self,
+        sender_pubkey: &[u8; 32],
         encrypted: &[u8],
-        nonce: &[u8; 12],
+        packet_id: u32,
+        from_node: u32,
     ) -> Option<Vec<u8, 240>> {
         let privkey = self.node_privkey.as_ref()?;
-        pki_decrypt(privkey, encrypted, nonce)
+        pki_decrypt(privkey, sender_pubkey, encrypted, packet_id, from_node)
     }
 }
 
@@ -520,29 +531,42 @@ mod tests {
 
     #[test]
     fn test_key_hash() {
-        let ctx = EncryptionContext::from_key_bytes(&[0x01, 0x02, 0x03, 0x04]);
-
-        assert_eq!(ctx.key_hash(), 0x04);
+        let ctx = EncryptionContext::from_key_bytes(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10]);
+        assert_eq!(ctx.key_hash(), xor_bytes(ctx.key.as_bytes()));
     }
 
     #[test]
     fn test_pki_encryption_roundtrip() {
-
         let alice_priv = [0x42u8; 32];
         let alice_pub = x25519::x25519_base(&alice_priv);
 
         let bob_priv = [0x24u8; 32];
-        let _bob_pub = x25519::x25519_base(&bob_priv);
+        let bob_pub = x25519::x25519_base(&bob_priv);
 
         let plaintext = b"Secret message for Alice";
-        let nonce = [0x11u8; 12];
+        let packet_id = 0x12345678;
+        let from_node = 0xABCDEF01;
+        let extra_nonce = 0x99887766;
 
+        let encrypted = pki_encrypt(
+            &alice_pub,
+            &bob_priv,
+            plaintext,
+            packet_id,
+            from_node,
+            extra_nonce,
+        )
+        .unwrap();
+        assert_eq!(encrypted.len(), plaintext.len() + PKI_OVERHEAD);
 
-        let encrypted = pki_encrypt(&alice_pub, &bob_priv, plaintext, &nonce).unwrap();
-        assert!(encrypted.len() > plaintext.len());
-
-
-        let decrypted = pki_decrypt(&alice_priv, &encrypted, &nonce).unwrap();
+        let decrypted = pki_decrypt(
+            &alice_priv,
+            &bob_pub,
+            &encrypted,
+            packet_id,
+            from_node,
+        )
+        .unwrap();
         assert_eq!(&decrypted[..], plaintext);
     }
 
