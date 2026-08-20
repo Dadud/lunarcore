@@ -425,6 +425,36 @@ impl BleManager {
 
         #[cfg(target_arch = "xtensa")]
         unsafe {
+            const DEFAULT_NAME: [u8; 32] = *b"LunarCore\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+            let (name_buf, name_len) = critical_section::with(|cs| {
+                if let Some(state) = BLE_STATE.borrow(cs).borrow().as_ref() {
+                    (state.device_name, state.device_name_len)
+                } else {
+                    (DEFAULT_NAME, 9)
+                }
+            });
+            let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("LunarCore");
+
+            let adv_data = build_adv_data(name, true, true);
+            let scan_rsp = build_scan_rsp(true, true);
+
+            extern "C" {
+                fn ble_gap_adv_set_data(data: *const u8, data_len: i32) -> i32;
+                fn ble_gap_adv_rsp_set_data(data: *const u8, data_len: i32) -> i32;
+            }
+
+            let rc = ble_gap_adv_set_data(adv_data.as_ptr(), adv_data.len() as i32);
+            if rc != 0 {
+                return Err(BleError::StackError(rc));
+            }
+
+            if !scan_rsp.is_empty() {
+                let rc = ble_gap_adv_rsp_set_data(scan_rsp.as_ptr(), scan_rsp.len() as i32);
+                if rc != 0 {
+                    return Err(BleError::StackError(rc));
+                }
+            }
+
             let mut adv_params = ble_gap_adv_params {
                 conn_mode: BLE_GAP_CONN_MODE_UND,
                 disc_mode: BLE_GAP_DISC_MODE_GEN,

@@ -9,19 +9,7 @@ use std::collections::HashMap;
 
 #[cfg(target_arch = "xtensa")]
 fn fill_random(dest: &mut [u8]) {
-
-    const RNG_DATA_REG: u32 = 0x3FF7_5144;
-
-    for chunk in dest.chunks_mut(4) {
-
-        let random_word: u32 = unsafe {
-            core::ptr::read_volatile(RNG_DATA_REG as *const u32)
-        };
-        let bytes = random_word.to_le_bytes();
-        for (i, byte) in chunk.iter_mut().enumerate() {
-            *byte = bytes[i];
-        }
-    }
+    crate::rng::fill_random(dest);
 }
 
 

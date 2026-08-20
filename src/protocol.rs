@@ -440,3 +440,28 @@ pub fn parse_config(data: &[u8]) -> Option<crate::sx1262::RadioConfig> {
         ldro: flags & 0x04 != 0,
     })
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_frame_encode_decode_roundtrip() {
+        let frame = Frame::with_data(Command::Ping, 42, b"hello").unwrap();
+        let encoded = frame.encode();
+
+        let mut parser = FrameParser::new();
+        let mut decoded = None;
+        for &byte in encoded.as_slice() {
+            if let Some(parsed) = parser.feed(byte) {
+                decoded = Some(parsed);
+            }
+        }
+
+        let parsed = decoded.expect("frame should decode");
+        assert_eq!(parsed.command, Command::Ping);
+        assert_eq!(parsed.sequence, 42);
+        assert_eq!(parsed.data.as_slice(), b"hello");
+    }
+}

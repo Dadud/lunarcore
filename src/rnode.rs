@@ -596,7 +596,7 @@ impl Default for RNodeIdentity {
             platform: "ESP32-S3",
             mcu: "ESP32-S3",
             board: "LunarNode",
-            fw_version: "1.0.0-lunarcore",
+            fw_version: concat!(env!("CARGO_PKG_VERSION"), "-lunarcore"),
             protocol_version: 1,
             hw_revision: 1,
         }

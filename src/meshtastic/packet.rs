@@ -51,8 +51,7 @@ pub fn parse_lora_packet(data: &[u8]) -> Option<MeshPacket> {
     let computed_mic = compute_mic(&data[..payload_end]);
 
     if !constant_time_eq(received_mic, &computed_mic) {
-
-
+        return None;
     }
 
     Some(MeshPacket {
