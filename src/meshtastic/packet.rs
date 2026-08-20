@@ -170,6 +170,32 @@ pub enum RoutingDecision {
 }
 
 
+pub fn node_last_byte(node_id: u32) -> u8 {
+    (node_id & 0xFF) as u8
+}
+
+
+pub fn should_relay_packet(packet: &MeshPacket, our_node_id: u32) -> bool {
+    if packet.hop_limit == 0 {
+        return false;
+    }
+
+    if packet.to == our_node_id {
+        return false;
+    }
+
+    if packet.hop_start == 0 {
+        return true;
+    }
+
+    if packet.next_hop == 0 || packet.next_hop == node_last_byte(our_node_id) {
+        return true;
+    }
+
+    false
+}
+
+
 pub fn route_packet(packet: &MeshPacket, our_node_id: u32, cache: &mut PacketCache, timestamp: u32) -> RoutingDecision {
 
     if cache.check_and_add(packet.from, packet.id, timestamp) {
@@ -199,13 +225,19 @@ pub fn route_packet(packet: &MeshPacket, our_node_id: u32, cache: &mut PacketCac
 
 pub fn prepare_relay_packet(data: &[u8], our_node_id: u32) -> Option<Vec<u8, 256>> {
     let packet = parse_lora_packet(data)?;
-    if packet.hop_limit == 0 {
+    if !should_relay_packet(&packet, our_node_id) {
         return None;
     }
 
     let payload = match &packet.payload {
         PacketPayload::Encrypted(payload) => payload.as_slice(),
         PacketPayload::Decoded(_) => return None,
+    };
+
+    let relay_next_hop = if packet.next_hop == 0 {
+        0
+    } else {
+        packet.next_hop
     };
 
     build_lora_packet(
@@ -217,19 +249,22 @@ pub fn prepare_relay_packet(data: &[u8], our_node_id: u32) -> Option<Vec<u8, 256
         packet.hop_start,
         packet.want_ack,
         packet.via_mqtt,
-        packet.next_hop,
-        (our_node_id & 0xFF) as u8,
+        relay_next_hop,
+        node_last_byte(our_node_id),
         payload,
     )
 }
 
 
-pub fn can_relay_packet(data: &[u8]) -> bool {
+pub fn can_relay_packet(data: &[u8], our_node_id: u32) -> bool {
     if data.len() < LORA_HEADER_SIZE {
         return false;
     }
-    let hop_limit = data[OFFSET_FLAGS] & FLAG_HOP_LIMIT_MASK;
-    hop_limit > 0
+    if let Some(packet) = parse_lora_packet(data) {
+        should_relay_packet(&packet, our_node_id)
+    } else {
+        false
+    }
 }
 
 
@@ -582,5 +617,43 @@ mod tests {
         let parsed = parse_lora_packet(&relay).unwrap();
         assert_eq!(parsed.hop_limit, 2);
         assert_eq!(parsed.relay_node, 0x78);
+    }
+
+    #[test]
+    fn test_directed_relay_filters_wrong_next_hop() {
+        let payload = [0xBBu8; 8];
+        let our_id = 0x12345678u32;
+        let original = build_lora_packet(
+            0x11111111,
+            0x22222222,
+            0x33333333,
+            8,
+            3,
+            3,
+            false,
+            false,
+            0x42,
+            0,
+            &payload,
+        )
+        .unwrap();
+
+        assert!(prepare_relay_packet(&original, our_id).is_none());
+
+        let for_us = build_lora_packet(
+            0x11111111,
+            0x22222222,
+            0x33333334,
+            8,
+            3,
+            3,
+            false,
+            false,
+            node_last_byte(our_id),
+            0,
+            &payload,
+        )
+        .unwrap();
+        assert!(prepare_relay_packet(&for_us, our_id).is_some());
     }
 }

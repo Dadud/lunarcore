@@ -3,6 +3,7 @@ pub mod channel;
 pub mod packet;
 pub mod encryption;
 pub mod node_db;
+pub mod admin;
 
 pub use protobuf::*;
 pub use channel::*;
@@ -403,6 +404,10 @@ pub struct MeshtasticHandler {
     node_db: NodeDb,
 
     local_privkey: Option<[u8; 32]>,
+
+    admin_session: admin::AdminSession,
+
+    pending_lora_tx: Option<Vec<u8, 256>>,
 }
 
 impl MeshtasticHandler {
@@ -423,13 +428,31 @@ impl MeshtasticHandler {
             config_channel_index: 0,
             node_db: NodeDb::new(),
             local_privkey: None,
+            admin_session: admin::AdminSession::new(),
+            pending_lora_tx: None,
         }
+    }
+
+
+    pub fn load_node_db(&mut self) -> usize {
+        self.node_db.load_from_nvs().unwrap_or(0)
+    }
+
+
+    pub fn persist_node_db(&self) {
+        let _ = self.node_db.save_to_nvs();
     }
 
 
     pub fn set_device_keys(&mut self, privkey: &[u8; 32], pubkey: &[u8; 32]) {
         self.local_privkey = Some(*privkey);
         self.node_db.set_public_key(self.node_id, *pubkey);
+        self.persist_node_db();
+    }
+
+
+    pub fn take_pending_lora_tx(&mut self) -> Option<Vec<u8, 256>> {
+        self.pending_lora_tx.take()
     }
 
 
@@ -448,7 +471,13 @@ impl MeshtasticHandler {
     }
 
 
-    pub fn process_lora_packet(&mut self, data: &[u8], rssi: i32, snr: f32) -> Option<MeshPacket> {
+    pub fn process_lora_packet(
+        &mut self,
+        data: &[u8],
+        rssi: i32,
+        snr: f32,
+        now_ms: u32,
+    ) -> Option<MeshPacket> {
         if data.len() < LORA_HEADER_SIZE {
             return None;
         }
@@ -461,7 +490,7 @@ impl MeshtasticHandler {
         packet.rx_snr = snr;
 
 
-        let decrypted = self.decrypt_packet(&packet)?;
+        let decrypted = self.decrypt_packet(&packet, now_ms)?;
 
         self.rx_count += 1;
 
@@ -553,20 +582,57 @@ impl MeshtasticHandler {
     }
 
 
-    fn ingest_decoded_packet(&mut self, packet: &MeshPacket) {
+    fn ingest_decoded_packet(&mut self, packet: &MeshPacket, now_ms: u32) {
+        if packet.relay_node != 0 {
+            self.node_db.set_next_hop(packet.from, packet.relay_node);
+            self.persist_node_db();
+        }
+
         if let PacketPayload::Decoded(ref data) = packet.payload {
-            if data.port == PortNum::NodeInfo {
-                if let Some(user) = protobuf::decode_user(&data.payload) {
-                    if let Some(pk) = user.public_key {
-                        self.node_db.set_public_key(packet.from, pk);
+            match data.port {
+                PortNum::NodeInfo => {
+                    if let Some(user) = protobuf::decode_user(&data.payload) {
+                        if let Some(pk) = user.public_key {
+                            self.node_db.set_public_key(packet.from, pk);
+                            self.persist_node_db();
+                        }
                     }
                 }
+                PortNum::Admin if packet.to == self.node_id => {
+                    if let Some(admin_resp) = self.handle_admin_request(&data.payload, now_ms) {
+                        if let Some(lora) = self.create_packet(
+                            packet.from,
+                            PortNum::Admin,
+                            &admin_resp,
+                            false,
+                        ) {
+                            self.pending_lora_tx = Some(lora);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
 
 
-    fn decrypt_packet(&mut self, packet: &MeshPacket) -> Option<MeshPacket> {
+    pub fn handle_admin_request(
+        &mut self,
+        payload: &[u8],
+        now_ms: u32,
+    ) -> Option<Vec<u8, MAX_MESSAGE_SIZE>> {
+        let (request, _) = admin::parse_admin_request(payload);
+        admin::build_admin_response(
+            request,
+            &mut self.admin_session,
+            now_ms,
+            self.node_id,
+            env!("CARGO_PKG_VERSION"),
+        )
+    }
+
+
+    fn decrypt_packet(&mut self, packet: &MeshPacket, now_ms: u32) -> Option<MeshPacket> {
         let mut result = packet.clone();
 
         if let PacketPayload::Encrypted(ref encrypted) = packet.payload {
@@ -588,7 +654,7 @@ impl MeshtasticHandler {
             }
         }
 
-        self.ingest_decoded_packet(&result);
+        self.ingest_decoded_packet(&result, now_ms);
         Some(result)
     }
 
@@ -640,6 +706,12 @@ impl MeshtasticHandler {
             self.primary_channel.encrypt(packet_id, self.node_id, &encoded)
         }?;
 
+        let next_hop = if to != 0xFFFFFFFF {
+            self.node_db.get_next_hop(to).unwrap_or(0)
+        } else {
+            0
+        };
+
         let lora_packet = packet::build_lora_packet(
             self.node_id,
             to,
@@ -649,7 +721,7 @@ impl MeshtasticHandler {
             DEFAULT_HOP_LIMIT,
             want_ack,
             false,
-            0,
+            next_hop,
             0,
             &encrypted,
         )?;
@@ -1141,37 +1213,16 @@ impl MeshtasticHandler {
     }
 
 
-    pub fn handle_admin_message(&mut self, payload: &[u8]) -> Option<Vec<u8, MAX_MESSAGE_SIZE>> {
+    pub fn handle_admin_message(
+        &mut self,
+        payload: &[u8],
+        now_ms: u32,
+    ) -> Option<Vec<u8, MAX_MESSAGE_SIZE>> {
         if payload.is_empty() {
             return None;
         }
 
-
-        let tag = payload[0];
-        let field_num = tag >> 3;
-
-        match field_num {
-
-            1 => self.encode_privacy_myinfo(),
-
-
-            7 => self.encode_privacy_nodeinfo(),
-
-
-            5 => {
-
-                None
-            }
-
-
-            6 => {
-
-                None
-            }
-
-
-            _ => None,
-        }
+        self.handle_admin_request(payload, now_ms)
     }
 }
 

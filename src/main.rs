@@ -588,6 +588,7 @@ where
 
         let mut meshtastic = MeshtasticHandler::new(node_id);
         meshtastic.set_device_keys(&identity.encryption_private, &identity.encryption_public);
+        let _ = meshtastic.load_node_db();
 
         Self {
             radio,
@@ -735,7 +736,10 @@ where
 
 
         let relay_data = if self.active_protocol() == Protocol::Meshtastic {
-            self.meshtastic.prepare_relay_packet(data)
+            match self.meshtastic.prepare_relay_packet(data) {
+                Some(relay) => Some(relay),
+                None => return false,
+            }
         } else {
             None
         };
@@ -1527,7 +1531,13 @@ where
             }
 
             Protocol::Meshtastic => {
-                if let Some(packet) = self.meshtastic.process_lora_packet(data, rssi as i32, snr as f32) {
+                let now = millis();
+                if let Some(packet) = self.meshtastic.process_lora_packet(
+                    data,
+                    rssi as i32,
+                    snr as f32,
+                    now,
+                ) {
                     if let Some(from_radio) = meshtastic::encode_fromradio_packet(&packet) {
                         if let Some(serial_frame) = self.meshtastic.build_serial_frame(&from_radio) {
                             let _ = uart.write(&serial_frame);
@@ -1536,6 +1546,10 @@ where
                         let _ = self.ble.queue_from_radio(&from_radio);
                         let _ = self.ble.notify_from_num(self.meshtastic.rx_count);
                     }
+                }
+
+                if let Some(admin_reply) = self.meshtastic.take_pending_lora_tx() {
+                    let _ = self.radio.transmit(&admin_reply);
                 }
             }
 
