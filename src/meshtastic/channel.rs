@@ -344,6 +344,21 @@ impl core::fmt::Debug for ChannelKey {
 }
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ChannelRole {
+    Disabled = 0,
+    Primary = 1,
+    Secondary = 2,
+}
+
+impl Default for ChannelRole {
+    fn default() -> Self {
+        ChannelRole::Disabled
+    }
+}
+
+
 #[derive(Clone)]
 pub struct Channel {
 
@@ -352,6 +367,10 @@ pub struct Channel {
     pub name: Vec<u8, MAX_CHANNEL_NAME>,
 
     pub key: ChannelKey,
+
+    pub psk: Vec<u8, 32>,
+
+    pub role: ChannelRole,
 
     pub modem_preset: ModemPreset,
 
@@ -365,10 +384,18 @@ pub struct Channel {
 impl Channel {
 
     pub fn new(index: u8) -> Self {
+        let mut psk = Vec::new();
+        let _ = psk.push(0x01);
         Self {
             index,
             name: Vec::new(),
             key: ChannelKey::default_key(),
+            psk,
+            role: if index == 0 {
+                ChannelRole::Primary
+            } else {
+                ChannelRole::Secondary
+            },
             modem_preset: ModemPreset::default(),
             uplink_enabled: false,
             downlink_enabled: false,
@@ -390,6 +417,9 @@ impl Channel {
 
 
     pub fn set_key(&mut self, key: &[u8]) {
+        self.psk.clear();
+        let len = core::cmp::min(key.len(), 32);
+        let _ = self.psk.extend_from_slice(&key[..len]);
         self.key = ChannelKey::from_psk(key);
     }
 
@@ -488,6 +518,7 @@ impl core::fmt::Debug for Channel {
             .field("index", &self.index)
             .field("name", &self.name_str())
             .field("key", &self.key)
+            .field("role", &self.role)
             .field("modem_preset", &self.modem_preset)
             .finish()
     }

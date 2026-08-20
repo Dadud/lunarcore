@@ -1,5 +1,7 @@
 use heapless::Vec;
 use super::MAX_MESSAGE_SIZE;
+use super::channel::Channel;
+use super::protobuf;
 
 
 pub const SESSION_PASSKEY_SIZE: usize = 8;
@@ -9,6 +11,10 @@ pub const PASSKEY_LIFETIME_MS: u32 = 300_000;
 pub const PASSKEY_REGEN_MS: u32 = 150_000;
 
 
+const ADMIN_GET_CHANNEL_REQUEST: u32 = 1;
+
+const ADMIN_GET_CHANNEL_RESPONSE: u32 = 2;
+
 const ADMIN_GET_OWNER_REQUEST: u32 = 3;
 
 const ADMIN_GET_OWNER_RESPONSE: u32 = 4;
@@ -16,6 +22,8 @@ const ADMIN_GET_OWNER_RESPONSE: u32 = 4;
 const ADMIN_GET_DEVICE_METADATA_REQUEST: u32 = 12;
 
 const ADMIN_GET_DEVICE_METADATA_RESPONSE: u32 = 13;
+
+const ADMIN_SET_CHANNEL: u32 = 33;
 
 const ADMIN_SESSION_PASSKEY: u32 = 101;
 
@@ -69,35 +77,54 @@ impl Default for AdminSession {
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParsedAdminRequest {
+pub enum AdminKind {
     GetOwner,
     GetDeviceMetadata,
-    StateChanging { session_passkey: [u8; SESSION_PASSKEY_SIZE] },
+    GetChannel,
+    SetChannel,
+    StateChanging,
     ReadOnly,
     Unknown,
 }
 
 
-pub fn parse_admin_request(payload: &[u8]) -> (ParsedAdminRequest, Option<[u8; SESSION_PASSKEY_SIZE]>) {
-    let mut idx = 0;
-    let mut request = ParsedAdminRequest::Unknown;
+pub struct ParsedAdmin {
+    pub kind: AdminKind,
+    pub session_passkey: Option<[u8; SESSION_PASSKEY_SIZE]>,
+    pub channel_index: u8,
+    pub channel: Option<Channel>,
+}
+
+
+pub fn parse_admin_request(payload: &[u8]) -> ParsedAdmin {
+    let mut kind = AdminKind::Unknown;
     let mut session_passkey = None;
+    let mut channel_index = 0u8;
+    let mut channel = None;
     let mut state_changing = false;
 
+    let mut idx = 0;
     while idx < payload.len() {
-        let tag = payload[idx];
-        idx += 1;
-        let field = tag >> 3;
-        let wire = tag & 0x07;
+        let (tag, consumed) = decode_varint(&payload[idx..]);
+        if consumed == 0 {
+            break;
+        }
+        idx += consumed;
+        let field = (tag as u32) >> 3;
+        let wire = (tag as u8) & 0x07;
 
         match wire {
             0 => {
                 let (val, consumed) = decode_varint(&payload[idx..]);
                 idx += consumed;
-                match field as u32 {
-                    ADMIN_GET_OWNER_REQUEST if val != 0 => request = ParsedAdminRequest::GetOwner,
+                match field {
+                    ADMIN_GET_CHANNEL_REQUEST if val != 0 => {
+                        kind = AdminKind::GetChannel;
+                        channel_index = val.saturating_sub(1) as u8;
+                    }
+                    ADMIN_GET_OWNER_REQUEST if val != 0 => kind = AdminKind::GetOwner,
                     ADMIN_GET_DEVICE_METADATA_REQUEST if val != 0 => {
-                        request = ParsedAdminRequest::GetDeviceMetadata
+                        kind = AdminKind::GetDeviceMetadata
                     }
                     97 | 98 | 99 | 100 | 102 => state_changing = true,
                     _ => {}
@@ -107,15 +134,24 @@ pub fn parse_admin_request(payload: &[u8]) -> (ParsedAdminRequest, Option<[u8; S
                 if idx >= payload.len() {
                     break;
                 }
-                let len = payload[idx] as usize;
-                idx += 1;
+                let (len, consumed) = decode_varint(&payload[idx..]);
+                idx += consumed;
+                let len = len as usize;
                 if idx + len > payload.len() {
                     break;
                 }
-                if field as u32 == ADMIN_SESSION_PASSKEY && len == SESSION_PASSKEY_SIZE {
+                let bytes = &payload[idx..idx + len];
+                if field == ADMIN_SESSION_PASSKEY && len == SESSION_PASSKEY_SIZE {
                     let mut key = [0u8; SESSION_PASSKEY_SIZE];
-                    key.copy_from_slice(&payload[idx..idx + len]);
+                    key.copy_from_slice(bytes);
                     session_passkey = Some(key);
+                } else if field == ADMIN_SET_CHANNEL {
+                    kind = AdminKind::SetChannel;
+                    state_changing = true;
+                    channel = protobuf::decode_channel(bytes);
+                    if let Some(ref ch) = channel {
+                        channel_index = ch.index;
+                    }
                 }
                 idx += len;
             }
@@ -132,34 +168,41 @@ pub fn parse_admin_request(payload: &[u8]) -> (ParsedAdminRequest, Option<[u8; S
         }
     }
 
-    if state_changing {
-        if let Some(key) = session_passkey {
-            request = ParsedAdminRequest::StateChanging { session_passkey: key };
-        } else {
-            request = ParsedAdminRequest::StateChanging {
-                session_passkey: [0u8; SESSION_PASSKEY_SIZE],
-            };
-        }
-    } else if request == ParsedAdminRequest::Unknown {
-        request = ParsedAdminRequest::ReadOnly;
+    if state_changing && kind != AdminKind::SetChannel {
+        kind = AdminKind::StateChanging;
+    } else if kind == AdminKind::Unknown {
+        kind = AdminKind::ReadOnly;
     }
 
-    (request, session_passkey)
+    ParsedAdmin {
+        kind,
+        session_passkey,
+        channel_index,
+        channel,
+    }
 }
 
 
 pub fn build_admin_response(
-    request: ParsedAdminRequest,
+    parsed: &ParsedAdmin,
     session: &mut AdminSession,
     now_ms: u32,
     node_id: u32,
     firmware_version: &str,
+    channel: Option<&Channel>,
 ) -> Option<Vec<u8, MAX_MESSAGE_SIZE>> {
+    if parsed.kind == AdminKind::SetChannel || parsed.kind == AdminKind::StateChanging {
+        let key = parsed.session_passkey.as_ref()?;
+        if !session.validate(key, now_ms) {
+            return None;
+        }
+    }
+
     let passkey = *session.ensure_fresh(now_ms);
     let mut admin = Vec::new();
 
-    match request {
-        ParsedAdminRequest::GetOwner => {
+    match parsed.kind {
+        AdminKind::GetOwner => {
             let mut user = Vec::new();
             let id = format_node_id(node_id);
             write_bytes(1, id.as_bytes(), &mut user)?;
@@ -169,26 +212,35 @@ pub fn build_admin_response(
             write_field_varint(7, 4, &mut user)?;
             write_message(ADMIN_GET_OWNER_RESPONSE, &user, &mut admin)?;
         }
-        ParsedAdminRequest::GetDeviceMetadata => {
+        AdminKind::GetDeviceMetadata => {
             let mut metadata = Vec::new();
             write_field_varint(1, 1, &mut metadata)?;
             write_bytes(2, firmware_version.as_bytes(), &mut metadata)?;
             write_field_varint(3, 1, &mut metadata)?;
             write_message(ADMIN_GET_DEVICE_METADATA_RESPONSE, &metadata, &mut admin)?;
         }
-        ParsedAdminRequest::ReadOnly | ParsedAdminRequest::Unknown => {
-            return None;
+        AdminKind::GetChannel => {
+            let ch = channel?;
+            let encoded = protobuf::encode_channel(ch)?;
+            write_message(ADMIN_GET_CHANNEL_RESPONSE, &encoded, &mut admin)?;
         }
-        ParsedAdminRequest::StateChanging { session_passkey } => {
-            if !session.validate(&session_passkey, now_ms) {
-                return None;
-            }
+        AdminKind::SetChannel => {
+            let ch = channel?;
+            let encoded = protobuf::encode_channel(ch)?;
+            write_message(ADMIN_GET_CHANNEL_RESPONSE, &encoded, &mut admin)?;
+        }
+        AdminKind::ReadOnly | AdminKind::Unknown | AdminKind::StateChanging => {
             return None;
         }
     }
 
     write_bytes(ADMIN_SESSION_PASSKEY, &passkey, &mut admin)?;
     Some(admin)
+}
+
+
+pub fn apply_channel_update(parsed: &ParsedAdmin) -> Option<Channel> {
+    parsed.channel.clone()
 }
 
 
@@ -294,7 +346,40 @@ mod tests {
     #[test]
     fn test_parse_get_device_metadata_request() {
         let payload = [0x60, 0x01];
-        let (req, _) = parse_admin_request(&payload);
-        assert_eq!(req, ParsedAdminRequest::GetDeviceMetadata);
+        let req = parse_admin_request(&payload);
+        assert_eq!(req.kind, AdminKind::GetDeviceMetadata);
+    }
+
+    #[test]
+    fn test_parse_get_channel_request_is_one_based() {
+        let payload = [0x08, 0x02];
+        let req = parse_admin_request(&payload);
+        assert_eq!(req.kind, AdminKind::GetChannel);
+        assert_eq!(req.channel_index, 1);
+    }
+
+    #[test]
+    fn test_set_channel_requires_passkey() {
+        let mut session = AdminSession::new();
+        let _ = session.ensure_fresh(1000);
+
+        let mut ch = Channel::new(1);
+        ch.set_name("Secondary");
+        ch.set_key(&[0x02]);
+        let encoded = protobuf::encode_channel(&ch).unwrap();
+
+        let mut payload = Vec::<u8, MAX_MESSAGE_SIZE>::new();
+        write_message(ADMIN_SET_CHANNEL, &encoded, &mut payload).unwrap();
+        let parsed = parse_admin_request(&payload);
+        assert_eq!(parsed.kind, AdminKind::SetChannel);
+        assert!(build_admin_response(
+            &parsed,
+            &mut session,
+            1000,
+            1,
+            "1.1.0",
+            Some(&ch)
+        )
+        .is_none());
     }
 }

@@ -113,6 +113,16 @@ impl NodeDb {
             .map(|r| r.next_hop)
     }
 
+    pub fn next_hop_hint(&self, node_id: u32) -> u8 {
+        self.get_next_hop(node_id).unwrap_or(0)
+    }
+
+    pub fn clear_next_hop(&mut self, node_id: u32) {
+        if let Some(record) = self.records.iter_mut().find(|r| r.node_id == node_id) {
+            record.next_hop = 0;
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &NodeRecord> {
         self.records.iter()
     }

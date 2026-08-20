@@ -774,6 +774,22 @@ where
     }
 
 
+    fn flush_meshtastic_tx(&mut self) {
+        if self.active_protocol() != Protocol::Meshtastic {
+            return;
+        }
+        let now = millis();
+        while let Some(tx) = self.meshtastic.poll_tx(now) {
+            if self.radio.transmit(&tx).is_ok() {
+                self.stats.tx_packets += 1;
+            }
+            if self.radio.start_rx(0).is_ok() {
+                self.rx_active = true;
+            }
+        }
+    }
+
+
     fn handle_dio1_interrupt(&mut self) {
 
         DIO1_TRIGGERED.store(false, Ordering::Relaxed);
@@ -1548,9 +1564,6 @@ where
                     }
                 }
 
-                if let Some(admin_reply) = self.meshtastic.take_pending_lora_tx() {
-                    let _ = self.radio.transmit(&admin_reply);
-                }
             }
 
             Protocol::RNode => {
@@ -2120,6 +2133,7 @@ fn run_lunarcore() -> ! {
         feed_watchdog();
 
         lunarcore.process_radio_events(&uart);
+        lunarcore.flush_meshtastic_tx();
 
         let mut byte = [0u8; 1];
         while uart.read(&mut byte, 0).unwrap_or(0) > 0 {

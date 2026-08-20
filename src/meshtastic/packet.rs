@@ -175,6 +175,30 @@ pub fn node_last_byte(node_id: u32) -> u8 {
 }
 
 
+pub fn hops_away(packet: &MeshPacket) -> u8 {
+    if packet.hop_start == 0 {
+        return 0;
+    }
+    packet.hop_start.saturating_sub(packet.hop_limit)
+}
+
+
+pub fn next_hop_for_dest(to: u32, known_next_hop: u8, relay_node: u8) -> u8 {
+    if to == 0xFFFFFFFF || known_next_hop == 0 || known_next_hop == relay_node {
+        0
+    } else {
+        known_next_hop
+    }
+}
+
+
+pub fn set_packet_next_hop(data: &mut [u8], next_hop: u8) {
+    if data.len() > OFFSET_NEXT_HOP {
+        data[OFFSET_NEXT_HOP] = next_hop;
+    }
+}
+
+
 pub fn should_relay_packet(packet: &MeshPacket, our_node_id: u32) -> bool {
     if packet.hop_limit == 0 {
         return false;
@@ -655,5 +679,18 @@ mod tests {
         )
         .unwrap();
         assert!(prepare_relay_packet(&for_us, our_id).is_some());
+    }
+
+    #[test]
+    fn test_hops_away_and_next_hop_preference() {
+        let packet = MeshPacket {
+            hop_start: 3,
+            hop_limit: 1,
+            ..Default::default()
+        };
+        assert_eq!(hops_away(&packet), 2);
+        assert_eq!(next_hop_for_dest(0xFFFFFFFF, 0x42, 0x01), 0);
+        assert_eq!(next_hop_for_dest(0x22222222, 0x42, 0x42), 0);
+        assert_eq!(next_hop_for_dest(0x22222222, 0x42, 0x01), 0x42);
     }
 }

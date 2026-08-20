@@ -4,6 +4,7 @@ pub mod packet;
 pub mod encryption;
 pub mod node_db;
 pub mod admin;
+pub mod packet_history;
 
 pub use protobuf::*;
 pub use channel::*;
@@ -374,6 +375,21 @@ impl Default for Role {
 }
 
 
+const NUM_RELIABLE_RETX: u8 = 3;
+
+const RETX_INTERVAL_MS: u32 = 800;
+
+
+struct PendingRetx {
+    from: u32,
+    id: u32,
+    to: u32,
+    packet: Vec<u8, 256>,
+    tries_left: u8,
+    next_tx_ms: u32,
+}
+
+
 pub struct MeshtasticHandler {
 
     pub node_id: u32,
@@ -407,7 +423,11 @@ pub struct MeshtasticHandler {
 
     admin_session: admin::AdminSession,
 
-    pending_lora_tx: Option<Vec<u8, 256>>,
+    pending_lora_tx: heapless::Deque<Vec<u8, 256>, 4>,
+
+    packet_history: packet_history::PacketHistory,
+
+    pending_retx: heapless::Vec<PendingRetx, 4>,
 }
 
 impl MeshtasticHandler {
@@ -429,7 +449,9 @@ impl MeshtasticHandler {
             node_db: NodeDb::new(),
             local_privkey: None,
             admin_session: admin::AdminSession::new(),
-            pending_lora_tx: None,
+            pending_lora_tx: heapless::Deque::new(),
+            packet_history: packet_history::PacketHistory::new(),
+            pending_retx: heapless::Vec::new(),
         }
     }
 
@@ -452,7 +474,15 @@ impl MeshtasticHandler {
 
 
     pub fn take_pending_lora_tx(&mut self) -> Option<Vec<u8, 256>> {
-        self.pending_lora_tx.take()
+        self.pending_lora_tx.pop_front()
+    }
+
+
+    pub fn poll_tx(&mut self, now_ms: u32) -> Option<Vec<u8, 256>> {
+        if let Some(packet) = self.pending_lora_tx.pop_front() {
+            return Some(packet);
+        }
+        self.poll_retransmit(now_ms)
     }
 
 
@@ -482,18 +512,22 @@ impl MeshtasticHandler {
             return None;
         }
 
-
         let mut packet = packet::parse_lora_packet(data)?;
-
-
         packet.rx_rssi = rssi;
         packet.rx_snr = snr;
 
+        if packet.relay_node != 0 {
+            self.packet_history
+                .add_relayer(packet.from, packet.id, packet.relay_node);
+        }
+
+        if packet.from == self.node_id {
+            self.stop_retransmit(packet.from, packet.id);
+            return None;
+        }
 
         let decrypted = self.decrypt_packet(&packet, now_ms)?;
-
         self.rx_count += 1;
-
         Some(decrypted)
     }
 
@@ -508,6 +542,55 @@ impl MeshtasticHandler {
             }
         }
         None
+    }
+
+
+    fn channel_index_for_hash(&self, hash: u8) -> u8 {
+        if self.primary_channel.hash() == hash {
+            return 0;
+        }
+        for (i, ch) in self.secondary_channels.iter().enumerate() {
+            if let Some(channel) = ch {
+                if channel.hash() == hash {
+                    return (i as u8) + 1;
+                }
+            }
+        }
+        0
+    }
+
+
+    fn get_channel(&self, index: u8) -> Option<&Channel> {
+        if index == 0 {
+            return Some(&self.primary_channel);
+        }
+        self.secondary_channels
+            .get((index as usize).saturating_sub(1))
+            .and_then(|ch| ch.as_ref())
+    }
+
+
+    fn set_channel_slot(&mut self, mut channel: Channel) {
+        let index = channel.index;
+        if index == 0 {
+            channel.role = ChannelRole::Primary;
+            self.primary_channel = channel;
+            return;
+        }
+        let slot = (index as usize).saturating_sub(1);
+        if slot < self.secondary_channels.len() {
+            if channel.role == ChannelRole::Disabled {
+                self.secondary_channels[slot] = None;
+            } else {
+                channel.role = ChannelRole::Secondary;
+                self.secondary_channels[slot] = Some(channel);
+            }
+        }
+    }
+
+
+    fn queue_lora_tx(&mut self, packet: Vec<u8, 256>) {
+        let _ = self.pending_lora_tx.push_back(packet);
     }
 
 
@@ -542,6 +625,8 @@ impl MeshtasticHandler {
                 index: 0,
                 name: Vec::new(),
                 key,
+                psk: Vec::new(),
+                role: ChannelRole::Primary,
                 modem_preset: ModemPreset::LongFast,
                 uplink_enabled: false,
                 downlink_enabled: false,
@@ -583,12 +668,13 @@ impl MeshtasticHandler {
 
 
     fn ingest_decoded_packet(&mut self, packet: &MeshPacket, now_ms: u32) {
-        if packet.relay_node != 0 {
-            self.node_db.set_next_hop(packet.from, packet.relay_node);
-            self.persist_node_db();
-        }
-
         if let PacketPayload::Decoded(ref data) = packet.payload {
+            self.maybe_learn_next_hop(packet, data);
+
+            if data.request_id != 0 {
+                self.stop_retransmit(packet.to, data.request_id);
+            }
+
             match data.port {
                 PortNum::NodeInfo => {
                     if let Some(user) = protobuf::decode_user(&data.payload) {
@@ -600,17 +686,57 @@ impl MeshtasticHandler {
                 }
                 PortNum::Admin if packet.to == self.node_id => {
                     if let Some(admin_resp) = self.handle_admin_request(&data.payload, now_ms) {
-                        if let Some(lora) = self.create_packet(
+                        let channel = self.channel_index_for_hash(packet.channel_hash);
+                        if let Some(lora) = self.create_packet_ex(
                             packet.from,
                             PortNum::Admin,
                             &admin_resp,
                             false,
+                            0,
+                            packet.id,
+                            channel,
                         ) {
-                            self.pending_lora_tx = Some(lora);
+                            self.queue_lora_tx(lora);
                         }
                     }
                 }
                 _ => {}
+            }
+
+            if packet.want_ack && packet.to == self.node_id && data.port != PortNum::Routing {
+                if let Some(ack) = self.create_ack(packet) {
+                    self.queue_lora_tx(ack);
+                }
+            }
+        }
+    }
+
+
+    fn maybe_learn_next_hop(&mut self, packet: &MeshPacket, data: &DataPayload) {
+        if packet.from == 0 || (data.request_id == 0 && data.reply_id == 0) {
+            return;
+        }
+
+        let orig_id = if data.request_id != 0 {
+            data.request_id
+        } else {
+            data.reply_id
+        };
+        let orig_sender = packet.to;
+        let our_relay = packet::node_last_byte(self.node_id);
+
+        let (was_already_relayer, _) =
+            self.packet_history
+                .was_relayer(packet.relay_node, orig_id, orig_sender);
+        let (we_were_relayer, we_were_sole) =
+            self.packet_history
+                .was_relayer(our_relay, orig_id, orig_sender);
+
+        let direct = packet::hops_away(packet) == 0;
+        if (we_were_relayer && was_already_relayer) || (direct && we_were_sole) {
+            if packet.relay_node != 0 {
+                self.node_db.set_next_hop(packet.from, packet.relay_node);
+                self.persist_node_db();
             }
         }
     }
@@ -621,13 +747,29 @@ impl MeshtasticHandler {
         payload: &[u8],
         now_ms: u32,
     ) -> Option<Vec<u8, MAX_MESSAGE_SIZE>> {
-        let (request, _) = admin::parse_admin_request(payload);
+        let parsed = admin::parse_admin_request(payload);
+
+        if parsed.kind == admin::AdminKind::SetChannel {
+            let passkey_ok = parsed
+                .session_passkey
+                .as_ref()
+                .map(|k| self.admin_session.validate(k, now_ms))
+                .unwrap_or(false);
+            if passkey_ok {
+                if let Some(updated) = admin::apply_channel_update(&parsed) {
+                    self.set_channel_slot(updated);
+                }
+            }
+        }
+
+        let channel = self.get_channel(parsed.channel_index).cloned();
         admin::build_admin_response(
-            request,
+            &parsed,
             &mut self.admin_session,
             now_ms,
             self.node_id,
             env!("CARGO_PKG_VERSION"),
+            channel.as_ref(),
         )
     }
 
@@ -666,8 +808,21 @@ impl MeshtasticHandler {
         payload: &[u8],
         want_ack: bool,
     ) -> Option<Vec<u8, 256>> {
-        let packet_id = self.next_packet_id();
+        self.create_packet_ex(to, port, payload, want_ack, 0, 0, 0)
+    }
 
+
+    pub fn create_packet_ex(
+        &mut self,
+        to: u32,
+        port: PortNum,
+        payload: &[u8],
+        want_ack: bool,
+        request_id: u32,
+        reply_id: u32,
+        channel_index: u8,
+    ) -> Option<Vec<u8, 256>> {
+        let packet_id = self.next_packet_id();
 
         let data = DataPayload {
             port,
@@ -675,13 +830,20 @@ impl MeshtasticHandler {
             want_response: want_ack,
             source: self.node_id,
             dest: to,
-            ..Default::default()
+            request_id,
+            reply_id,
+            emoji: 0,
         };
 
-
         let encoded = protobuf::encode_data(&data)?;
+        let our_relay = packet::node_last_byte(self.node_id);
+        let next_hop = packet::next_hop_for_dest(to, self.node_db.next_hop_hint(to), our_relay);
 
-        let channel_hash = self.primary_channel.hash();
+        let channel_hash = self
+            .get_channel(channel_index)
+            .map(|c| c.hash())
+            .unwrap_or_else(|| self.primary_channel.hash());
+
         let encrypted = if to != 0xFFFFFFFF && to != self.node_id {
             if let (Some(recipient_pub), Some(sender_priv)) = (
                 self.node_db.get_public_key(to),
@@ -698,19 +860,13 @@ impl MeshtasticHandler {
                     self.node_id,
                     extra_nonce,
                 )
-                .or_else(|| self.primary_channel.encrypt(packet_id, self.node_id, &encoded))
+                .or_else(|| self.encrypt_on_channel(channel_index, packet_id, &encoded))
             } else {
-                self.primary_channel.encrypt(packet_id, self.node_id, &encoded)
+                self.encrypt_on_channel(channel_index, packet_id, &encoded)
             }
         } else {
-            self.primary_channel.encrypt(packet_id, self.node_id, &encoded)
+            self.encrypt_on_channel(channel_index, packet_id, &encoded)
         }?;
-
-        let next_hop = if to != 0xFFFFFFFF {
-            self.node_db.get_next_hop(to).unwrap_or(0)
-        } else {
-            0
-        };
 
         let lora_packet = packet::build_lora_packet(
             self.node_id,
@@ -722,13 +878,116 @@ impl MeshtasticHandler {
             want_ack,
             false,
             next_hop,
-            0,
+            our_relay,
             &encrypted,
         )?;
 
-        self.tx_count += 1;
+        self.packet_history.note_tx(
+            self.node_id,
+            packet_id,
+            next_hop,
+            DEFAULT_HOP_LIMIT,
+            our_relay,
+        );
 
+        if want_ack && to != 0xFFFFFFFF {
+            self.start_retransmit(self.node_id, packet_id, to, &lora_packet);
+        }
+
+        self.tx_count += 1;
         Some(lora_packet)
+    }
+
+
+    fn encrypt_on_channel(
+        &self,
+        index: u8,
+        packet_id: u32,
+        plaintext: &[u8],
+    ) -> Option<Vec<u8, 256>> {
+        match self.get_channel(index) {
+            Some(ch) => ch.encrypt(packet_id, self.node_id, plaintext),
+            None => self.primary_channel.encrypt(packet_id, self.node_id, plaintext),
+        }
+    }
+
+
+    fn create_ack(&mut self, original: &MeshPacket) -> Option<Vec<u8, 256>> {
+        let payload = protobuf::encode_routing_error(RoutingError::None)?;
+        let channel = self.channel_index_for_hash(original.channel_hash);
+        self.create_packet_ex(
+            original.from,
+            PortNum::Routing,
+            &payload,
+            false,
+            original.id,
+            0,
+            channel,
+        )
+    }
+
+
+    fn start_retransmit(
+        &mut self,
+        from: u32,
+        id: u32,
+        to: u32,
+        packet: &[u8],
+    ) {
+        self.stop_retransmit(from, id);
+        if self.pending_retx.len() >= 4 {
+            let _ = self.pending_retx.remove(0);
+        }
+        let mut copy = Vec::new();
+        if copy.extend_from_slice(packet).is_err() {
+            return;
+        }
+        let _ = self.pending_retx.push(PendingRetx {
+            from,
+            id,
+            to,
+            packet: copy,
+            tries_left: NUM_RELIABLE_RETX - 1,
+            next_tx_ms: 0,
+        });
+    }
+
+
+    fn stop_retransmit(&mut self, from: u32, id: u32) {
+        self.pending_retx.retain(|p| !(p.from == from && p.id == id));
+    }
+
+
+    fn poll_retransmit(&mut self, now_ms: u32) -> Option<Vec<u8, 256>> {
+        let mut due_index = None;
+        for (i, pending) in self.pending_retx.iter_mut().enumerate() {
+            if pending.next_tx_ms == 0 {
+                pending.next_tx_ms = now_ms.wrapping_add(RETX_INTERVAL_MS);
+                continue;
+            }
+            if now_ms.wrapping_sub(pending.next_tx_ms) < u32::MAX / 2 {
+                due_index = Some(i);
+                break;
+            }
+        }
+        let i = due_index?;
+        if self.pending_retx[i].tries_left == 0 {
+            let _ = self.pending_retx.remove(i);
+            return None;
+        }
+
+        let last_try = self.pending_retx[i].tries_left == 1;
+        if last_try {
+            packet::set_packet_next_hop(&mut self.pending_retx[i].packet, 0);
+            let dest = self.pending_retx[i].to;
+            self.node_db.clear_next_hop(dest);
+        }
+
+        let mut copy = Vec::new();
+        let _ = copy.extend_from_slice(&self.pending_retx[i].packet);
+        self.pending_retx[i].tries_left -= 1;
+        self.pending_retx[i].next_tx_ms = now_ms.wrapping_add(RETX_INTERVAL_MS);
+        Some(copy)
     }
 
 
@@ -938,7 +1197,7 @@ impl MeshtasticHandler {
         let payload_data = inner_payload?;
 
 
-        self.create_packet(to, port, &payload_data, want_ack)
+        self.create_packet_ex(to, port, &payload_data, want_ack, 0, 0, channel)
     }
 
 
@@ -1651,5 +1910,126 @@ mod tests {
 
         let parsed = handler.parse_serial_frame(&frame).unwrap();
         assert_eq!(&parsed[..], payload);
+    }
+
+    #[test]
+    fn test_next_hop_learned_from_direct_ack() {
+        let mut sender = MeshtasticHandler::new(0x11111111);
+        let mut dest = MeshtasticHandler::new(0x22222222);
+
+        let packet = sender
+            .create_text_message(dest.node_id, "hello")
+            .expect("sender builds DM");
+        let parsed_tx = packet::parse_lora_packet(&packet).unwrap();
+        assert_eq!(parsed_tx.next_hop, 0);
+        assert_eq!(parsed_tx.relay_node, packet::node_last_byte(sender.node_id));
+
+        let decoded = dest
+            .process_lora_packet(&packet, -80, 5.0, 1_000)
+            .expect("dest decrypts DM");
+        match decoded.payload {
+            PacketPayload::Decoded(data) => {
+                assert_eq!(data.port, PortNum::TextMessage);
+                assert_eq!(&data.payload[..], b"hello");
+            }
+            _ => panic!("expected decoded payload"),
+        }
+
+        let ack = dest
+            .take_pending_lora_tx()
+            .expect("dest queued routing ACK");
+        let parsed_ack = packet::parse_lora_packet(&ack).unwrap();
+        assert_eq!(parsed_ack.to, sender.node_id);
+        assert_eq!(parsed_ack.from, dest.node_id);
+        assert_eq!(parsed_ack.relay_node, packet::node_last_byte(dest.node_id));
+
+        assert!(sender
+            .process_lora_packet(&ack, -80, 5.0, 1_100)
+            .is_some());
+        assert_eq!(
+            sender.node_db.next_hop_hint(dest.node_id),
+            packet::node_last_byte(dest.node_id)
+        );
+
+        let follow_up = sender
+            .create_text_message(dest.node_id, "again")
+            .expect("follow-up DM");
+        let parsed_follow = packet::parse_lora_packet(&follow_up).unwrap();
+        assert_eq!(
+            parsed_follow.next_hop,
+            packet::node_last_byte(dest.node_id)
+        );
+    }
+
+    #[test]
+    fn test_last_retransmit_clears_next_hop() {
+        let mut handler = MeshtasticHandler::new(0x11111111);
+        handler
+            .node_db
+            .set_next_hop(0x22222222, 0x22);
+        let packet = handler
+            .create_text_message(0x22222222, "retry")
+            .unwrap();
+        assert_eq!(packet::parse_lora_packet(&packet).unwrap().next_hop, 0x22);
+
+        let _ = handler.poll_tx(0);
+        let first = handler.poll_tx(RETX_INTERVAL_MS).expect("first retx");
+        assert_eq!(packet::parse_lora_packet(&first).unwrap().next_hop, 0x22);
+
+        let last = handler
+            .poll_tx(RETX_INTERVAL_MS.wrapping_mul(2))
+            .expect("flood fallback retx");
+        assert_eq!(packet::parse_lora_packet(&last).unwrap().next_hop, 0);
+        assert_eq!(handler.node_db.next_hop_hint(0x22222222), 0);
+    }
+
+    #[test]
+    fn test_secondary_channel_admin_get_set() {
+        let mut handler = MeshtasticHandler::new(0xABCDu32);
+        let mut session_key = *handler.admin_session.ensure_fresh(1_000);
+
+        let mut ch = Channel::new(1);
+        ch.set_name("Chat");
+        ch.set_key(&[0x02]);
+        ch.role = ChannelRole::Secondary;
+        let encoded_ch = protobuf::encode_channel(&ch).unwrap();
+
+        let mut encoder = ProtobufEncoder::<MAX_MESSAGE_SIZE>::new();
+        encoder.write_bytes_field(33, &encoded_ch);
+        encoder.write_bytes_field(101, &session_key);
+        let payload = encoder.finish();
+
+        let response = handler
+            .handle_admin_request(&payload, 1_000)
+            .expect("set channel accepted");
+        assert!(!response.is_empty());
+        assert_eq!(
+            handler.secondary_channels[0].as_ref().unwrap().name_str(),
+            "Chat"
+        );
+
+        let get = [0x08, 0x02];
+        let get_resp = handler
+            .handle_admin_request(&get, 1_000)
+            .expect("get channel");
+        assert!(get_resp.len() > 8);
+
+        let packet = handler
+            .create_packet_ex(
+                0xFFFFFFFF,
+                PortNum::TextMessage,
+                b"sec",
+                false,
+                0,
+                0,
+                1,
+            )
+            .unwrap();
+        let parsed = packet::parse_lora_packet(&packet).unwrap();
+        assert_eq!(
+            parsed.channel_hash,
+            handler.secondary_channels[0].as_ref().unwrap().hash()
+        );
+        let _ = session_key;
     }
 }
