@@ -9,19 +9,7 @@ use std::collections::HashMap;
 
 #[cfg(target_arch = "xtensa")]
 fn fill_random(dest: &mut [u8]) {
-
-    const RNG_DATA_REG: u32 = 0x3FF7_5144;
-
-    for chunk in dest.chunks_mut(4) {
-
-        let random_word: u32 = unsafe {
-            core::ptr::read_volatile(RNG_DATA_REG as *const u32)
-        };
-        let bytes = random_word.to_le_bytes();
-        for (i, byte) in chunk.iter_mut().enumerate() {
-            *byte = bytes[i];
-        }
-    }
+    crate::rng::fill_random(dest);
 }
 
 
@@ -391,11 +379,13 @@ impl Session {
 
     fn should_ratchet(&self) -> bool {
         self.send_count >= MAX_MESSAGES_BEFORE_RATCHET
-
+            || current_time_secs().saturating_sub(self.last_ratchet_time)
+                >= MAX_TIME_BEFORE_RATCHET_SECS
     }
 
 
     fn advance_send_ratchet(&mut self) {
+        self.last_ratchet_time = current_time_secs();
 
         let mut new_private = [0u8; 32];
         fill_random(&mut new_private);
@@ -532,6 +522,25 @@ impl Session {
 }
 
 
+#[cfg(target_arch = "xtensa")]
+fn current_time_secs() -> u64 {
+    unsafe { (esp_idf_sys::xTaskGetTickCount() as u64) / 1000 }
+}
+
+#[cfg(not(target_arch = "xtensa"))]
+fn current_time_secs() -> u64 {
+    0
+}
+
+
+fn peer_key(peer_public: &[u8; 32]) -> [u8; 8] {
+    let hash = crate::crypto::sha256::Sha256::hash(peer_public);
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&hash[..8]);
+    key
+}
+
+
 pub struct SessionManager {
 
 
@@ -547,15 +556,12 @@ impl SessionManager {
 
 
     pub fn get_session(&mut self, peer_public: &[u8; 32]) -> Option<&mut Session> {
-        let mut key = [0u8; 8];
-        key.copy_from_slice(&peer_public[..8]);
-        self.sessions.get_mut(&key)
+        self.sessions.get_mut(&peer_key(peer_public))
     }
 
 
     pub fn create_session(&mut self, params: SessionParams) {
-        let mut key = [0u8; 8];
-        key.copy_from_slice(&params.their_public[..8]);
+        let key = peer_key(&params.their_public);
 
         let session = Session::new(params);
         self.sessions.insert(key, session);
@@ -563,9 +569,7 @@ impl SessionManager {
 
 
     pub fn remove_session(&mut self, peer_public: &[u8; 32]) {
-        let mut key = [0u8; 8];
-        key.copy_from_slice(&peer_public[..8]);
-        self.sessions.remove(&key);
+        self.sessions.remove(&peer_key(peer_public));
     }
 }
 

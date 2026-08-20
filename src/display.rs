@@ -507,7 +507,7 @@ where
 
 
         self.display.draw_text_centered(8, "LunarCore");
-        self.display.draw_text_centered(18, "v1.0.0");
+        self.display.draw_text_centered(18, concat!("v", env!("CARGO_PKG_VERSION")));
 
 
         self.display.draw_text_centered(32, "Unified Mesh");

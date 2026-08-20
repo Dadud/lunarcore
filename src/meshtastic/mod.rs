@@ -2,11 +2,15 @@ pub mod protobuf;
 pub mod channel;
 pub mod packet;
 pub mod encryption;
+pub mod node_db;
+pub mod admin;
+pub mod packet_history;
 
 pub use protobuf::*;
 pub use channel::*;
 pub use packet::*;
 pub use encryption::*;
+pub use node_db::*;
 
 use heapless::Vec;
 
@@ -23,7 +27,7 @@ pub const LORA_HEADER_SIZE: usize = 16;
 pub const MAX_LORA_PAYLOAD: usize = 237;
 
 
-pub const MIC_SIZE: usize = 4;
+pub const MIC_SIZE: usize = 0;
 
 
 pub const DEFAULT_HOP_LIMIT: u8 = 3;
@@ -95,11 +99,23 @@ pub struct MeshPacket {
 
     pub channel: u8,
 
+    pub channel_hash: u8,
+
     pub id: u32,
 
     pub hop_limit: u8,
 
+    pub hop_start: u8,
+
     pub want_ack: bool,
+
+    pub pki_encrypted: bool,
+
+    pub via_mqtt: bool,
+
+    pub next_hop: u8,
+
+    pub relay_node: u8,
 
     pub priority: Priority,
 
@@ -174,9 +190,15 @@ impl Default for MeshPacket {
             from: 0,
             to: 0xFFFFFFFF,
             channel: 0,
+            channel_hash: 0,
             id: 0,
             hop_limit: DEFAULT_HOP_LIMIT,
+            hop_start: DEFAULT_HOP_LIMIT,
             want_ack: false,
+            pki_encrypted: false,
+            via_mqtt: false,
+            next_hop: 0,
+            relay_node: 0,
             priority: Priority::Default,
             rx_time: 0,
             rx_snr: 0.0,
@@ -231,6 +253,8 @@ pub struct User {
     pub is_licensed: bool,
 
     pub role: Role,
+
+    pub public_key: Option<[u8; 32]>,
 }
 
 
@@ -351,6 +375,21 @@ impl Default for Role {
 }
 
 
+const NUM_RELIABLE_RETX: u8 = 3;
+
+const RETX_INTERVAL_MS: u32 = 800;
+
+
+struct PendingRetx {
+    from: u32,
+    id: u32,
+    to: u32,
+    packet: Vec<u8, 256>,
+    tries_left: u8,
+    next_tx_ms: u32,
+}
+
+
 pub struct MeshtasticHandler {
 
     pub node_id: u32,
@@ -377,6 +416,18 @@ pub struct MeshtasticHandler {
     config_request_id: u32,
 
     config_channel_index: u8,
+
+    node_db: NodeDb,
+
+    local_privkey: Option<[u8; 32]>,
+
+    admin_session: admin::AdminSession,
+
+    pending_lora_tx: heapless::Deque<Vec<u8, 256>, 4>,
+
+    packet_history: packet_history::PacketHistory,
+
+    pending_retx: heapless::Vec<PendingRetx, 4>,
 }
 
 impl MeshtasticHandler {
@@ -395,7 +446,48 @@ impl MeshtasticHandler {
             pending_responses: heapless::Deque::new(),
             config_request_id: 0,
             config_channel_index: 0,
+            node_db: NodeDb::new(),
+            local_privkey: None,
+            admin_session: admin::AdminSession::new(),
+            pending_lora_tx: heapless::Deque::new(),
+            packet_history: packet_history::PacketHistory::new(),
+            pending_retx: heapless::Vec::new(),
         }
+    }
+
+
+    pub fn load_node_db(&mut self) -> usize {
+        self.node_db.load_from_nvs().unwrap_or(0)
+    }
+
+
+    pub fn persist_node_db(&self) {
+        let _ = self.node_db.save_to_nvs();
+    }
+
+
+    pub fn set_device_keys(&mut self, privkey: &[u8; 32], pubkey: &[u8; 32]) {
+        self.local_privkey = Some(*privkey);
+        self.node_db.set_public_key(self.node_id, *pubkey);
+        self.persist_node_db();
+    }
+
+
+    pub fn take_pending_lora_tx(&mut self) -> Option<Vec<u8, 256>> {
+        self.pending_lora_tx.pop_front()
+    }
+
+
+    pub fn poll_tx(&mut self, now_ms: u32) -> Option<Vec<u8, 256>> {
+        if let Some(packet) = self.pending_lora_tx.pop_front() {
+            return Some(packet);
+        }
+        self.poll_retransmit(now_ms)
+    }
+
+
+    pub fn prepare_relay_packet(&self, data: &[u8]) -> Option<Vec<u8, 256>> {
+        packet::prepare_relay_packet(data, self.node_id)
     }
 
 
@@ -405,57 +497,306 @@ impl MeshtasticHandler {
 
 
     pub fn next_packet_id(&mut self) -> u32 {
-        self.last_packet_id = self.last_packet_id.wrapping_add(1);
-        if self.last_packet_id == 0 {
-            self.last_packet_id = 1;
-        }
-        self.last_packet_id
+        crate::packet_id::next_packet_id()
     }
 
 
-    pub fn process_lora_packet(&mut self, data: &[u8], rssi: i32, snr: f32) -> Option<MeshPacket> {
-        if data.len() < LORA_HEADER_SIZE + MIC_SIZE {
+    pub fn process_lora_packet(
+        &mut self,
+        data: &[u8],
+        rssi: i32,
+        snr: f32,
+        now_ms: u32,
+    ) -> Option<MeshPacket> {
+        if data.len() < LORA_HEADER_SIZE {
             return None;
         }
 
-
         let mut packet = packet::parse_lora_packet(data)?;
-
-
         packet.rx_rssi = rssi;
         packet.rx_snr = snr;
 
+        if packet.relay_node != 0 {
+            self.packet_history
+                .add_relayer(packet.from, packet.id, packet.relay_node);
+        }
 
-        let decrypted = self.decrypt_packet(&packet)?;
+        if packet.from == self.node_id {
+            self.stop_retransmit(packet.from, packet.id);
+            return None;
+        }
 
+        let decrypted = self.decrypt_packet(&packet, now_ms)?;
         self.rx_count += 1;
-
         Some(decrypted)
     }
 
 
-    fn decrypt_packet(&self, packet: &MeshPacket) -> Option<MeshPacket> {
-        let mut result = packet.clone();
+    fn find_channel_by_hash(&self, hash: u8) -> Option<&Channel> {
+        if self.primary_channel.hash() == hash {
+            return Some(&self.primary_channel);
+        }
+        for ch in self.secondary_channels.iter().flatten() {
+            if ch.hash() == hash {
+                return Some(ch);
+            }
+        }
+        None
+    }
 
-        if let PacketPayload::Encrypted(ref encrypted) = packet.payload {
 
-            let channel = if packet.channel == 0 {
-                &self.primary_channel
+    fn channel_index_for_hash(&self, hash: u8) -> u8 {
+        if self.primary_channel.hash() == hash {
+            return 0;
+        }
+        for (i, ch) in self.secondary_channels.iter().enumerate() {
+            if let Some(channel) = ch {
+                if channel.hash() == hash {
+                    return (i as u8) + 1;
+                }
+            }
+        }
+        0
+    }
+
+
+    fn get_channel(&self, index: u8) -> Option<&Channel> {
+        if index == 0 {
+            return Some(&self.primary_channel);
+        }
+        self.secondary_channels
+            .get((index as usize).saturating_sub(1))
+            .and_then(|ch| ch.as_ref())
+    }
+
+
+    fn set_channel_slot(&mut self, mut channel: Channel) {
+        let index = channel.index;
+        if index == 0 {
+            channel.role = ChannelRole::Primary;
+            self.primary_channel = channel;
+            return;
+        }
+        let slot = (index as usize).saturating_sub(1);
+        if slot < self.secondary_channels.len() {
+            if channel.role == ChannelRole::Disabled {
+                self.secondary_channels[slot] = None;
             } else {
-                self.secondary_channels
-                    .get((packet.channel - 1) as usize)?
-                    .as_ref()?
-            };
+                channel.role = ChannelRole::Secondary;
+                self.secondary_channels[slot] = Some(channel);
+            }
+        }
+    }
 
 
-            let decrypted = channel.decrypt(packet.id, packet.from, encrypted)?;
+    fn queue_lora_tx(&mut self, packet: Vec<u8, 256>) {
+        let _ = self.pending_lora_tx.push_back(packet);
+    }
 
 
-            if let Some(data) = protobuf::decode_data(&decrypted) {
-                result.payload = PacketPayload::Decoded(data);
+    fn into_lora_payload(data: &[u8]) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
+        if data.len() > MAX_LORA_PAYLOAD {
+            return None;
+        }
+        Vec::from_slice(data).ok()
+    }
+
+
+    fn decrypt_with_channel(&self, channel: &Channel, packet: &MeshPacket, ciphertext: &[u8]) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
+        let plaintext = channel.decrypt(packet.id, packet.from, ciphertext)?;
+        let payload = Self::into_lora_payload(&plaintext)?;
+        if protobuf::decode_data(&payload).is_some() {
+            Some(payload)
+        } else {
+            None
+        }
+    }
+
+
+    fn try_channel_decrypt(&self, packet: &MeshPacket, ciphertext: &[u8]) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
+        if let Some(channel) = self.find_channel_by_hash(packet.channel_hash) {
+            if let Some(plaintext) = self.decrypt_with_channel(channel, packet, ciphertext) {
+                return Some(plaintext);
             }
         }
 
+        if let Some(key) = channel::match_default_preset_key(packet.channel_hash) {
+            let temp = Channel {
+                index: 0,
+                name: Vec::new(),
+                key,
+                psk: Vec::new(),
+                role: ChannelRole::Primary,
+                modem_preset: ModemPreset::LongFast,
+                uplink_enabled: false,
+                downlink_enabled: false,
+                position_precision: 0,
+            };
+            if let Some(plaintext) = self.decrypt_with_channel(&temp, packet, ciphertext) {
+                return Some(plaintext);
+            }
+        }
+
+        None
+    }
+
+
+    fn try_pki_decrypt(&self, packet: &MeshPacket, ciphertext: &[u8]) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
+        if packet.to != self.node_id {
+            return None;
+        }
+        if ciphertext.len() < PKI_OVERHEAD {
+            return None;
+        }
+
+        let sender_pubkey = self.node_db.get_public_key(packet.from)?;
+        let privkey = self.local_privkey.as_ref()?;
+        let mut decrypted = pki_decrypt(
+            privkey,
+            sender_pubkey,
+            ciphertext,
+            packet.id,
+            packet.from,
+        )?;
+        let payload = Self::into_lora_payload(&decrypted)?;
+        if protobuf::decode_data(&payload).is_some() {
+            Some(payload)
+        } else {
+            None
+        }
+    }
+
+
+    fn ingest_decoded_packet(&mut self, packet: &MeshPacket, now_ms: u32) {
+        if let PacketPayload::Decoded(ref data) = packet.payload {
+            self.maybe_learn_next_hop(packet, data);
+
+            if data.request_id != 0 {
+                self.stop_retransmit(packet.to, data.request_id);
+            }
+
+            match data.port {
+                PortNum::NodeInfo => {
+                    if let Some(user) = protobuf::decode_user(&data.payload) {
+                        if let Some(pk) = user.public_key {
+                            self.node_db.set_public_key(packet.from, pk);
+                            self.persist_node_db();
+                        }
+                    }
+                }
+                PortNum::Admin if packet.to == self.node_id => {
+                    if let Some(admin_resp) = self.handle_admin_request(&data.payload, now_ms) {
+                        let channel = self.channel_index_for_hash(packet.channel_hash);
+                        if let Some(lora) = self.create_packet_ex(
+                            packet.from,
+                            PortNum::Admin,
+                            &admin_resp,
+                            false,
+                            0,
+                            packet.id,
+                            channel,
+                        ) {
+                            self.queue_lora_tx(lora);
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            if packet.want_ack && packet.to == self.node_id && data.port != PortNum::Routing {
+                if let Some(ack) = self.create_ack(packet) {
+                    self.queue_lora_tx(ack);
+                }
+            }
+        }
+    }
+
+
+    fn maybe_learn_next_hop(&mut self, packet: &MeshPacket, data: &DataPayload) {
+        if packet.from == 0 || (data.request_id == 0 && data.reply_id == 0) {
+            return;
+        }
+
+        let orig_id = if data.request_id != 0 {
+            data.request_id
+        } else {
+            data.reply_id
+        };
+        let orig_sender = packet.to;
+        let our_relay = packet::node_last_byte(self.node_id);
+
+        let (was_already_relayer, _) =
+            self.packet_history
+                .was_relayer(packet.relay_node, orig_id, orig_sender);
+        let (we_were_relayer, we_were_sole) =
+            self.packet_history
+                .was_relayer(our_relay, orig_id, orig_sender);
+
+        let direct = packet::hops_away(packet) == 0;
+        if (we_were_relayer && was_already_relayer) || (direct && we_were_sole) {
+            if packet.relay_node != 0 {
+                self.node_db.set_next_hop(packet.from, packet.relay_node);
+                self.persist_node_db();
+            }
+        }
+    }
+
+
+    pub fn handle_admin_request(
+        &mut self,
+        payload: &[u8],
+        now_ms: u32,
+    ) -> Option<Vec<u8, MAX_MESSAGE_SIZE>> {
+        let parsed = admin::parse_admin_request(payload);
+
+        if parsed.kind == admin::AdminKind::SetChannel {
+            let passkey_ok = parsed
+                .session_passkey
+                .as_ref()
+                .map(|k| self.admin_session.validate(k, now_ms))
+                .unwrap_or(false);
+            if passkey_ok {
+                if let Some(updated) = admin::apply_channel_update(&parsed) {
+                    self.set_channel_slot(updated);
+                }
+            }
+        }
+
+        let channel = self.get_channel(parsed.channel_index).cloned();
+        admin::build_admin_response(
+            &parsed,
+            &mut self.admin_session,
+            now_ms,
+            self.node_id,
+            env!("CARGO_PKG_VERSION"),
+            channel.as_ref(),
+        )
+    }
+
+
+    fn decrypt_packet(&mut self, packet: &MeshPacket, now_ms: u32) -> Option<MeshPacket> {
+        let mut result = packet.clone();
+
+        if let PacketPayload::Encrypted(ref encrypted) = packet.payload {
+            let (plaintext, pki_encrypted) =
+                if let Some(plaintext) = self.try_pki_decrypt(packet, encrypted) {
+                    (plaintext, true)
+                } else if let Some(plaintext) = self.try_channel_decrypt(packet, encrypted) {
+                    (plaintext, false)
+                } else {
+                    return None;
+                };
+
+            result.pki_encrypted = pki_encrypted;
+
+            if let Some(data) = protobuf::decode_data(&plaintext) {
+                result.payload = PacketPayload::Decoded(data);
+            } else {
+                return None;
+            }
+        }
+
+        self.ingest_decoded_packet(&result, now_ms);
         Some(result)
     }
 
@@ -467,8 +808,21 @@ impl MeshtasticHandler {
         payload: &[u8],
         want_ack: bool,
     ) -> Option<Vec<u8, 256>> {
-        let packet_id = self.next_packet_id();
+        self.create_packet_ex(to, port, payload, want_ack, 0, 0, 0)
+    }
 
+
+    pub fn create_packet_ex(
+        &mut self,
+        to: u32,
+        port: PortNum,
+        payload: &[u8],
+        want_ack: bool,
+        request_id: u32,
+        reply_id: u32,
+        channel_index: u8,
+    ) -> Option<Vec<u8, 256>> {
+        let packet_id = self.next_packet_id();
 
         let data = DataPayload {
             port,
@@ -476,29 +830,164 @@ impl MeshtasticHandler {
             want_response: want_ack,
             source: self.node_id,
             dest: to,
-            ..Default::default()
+            request_id,
+            reply_id,
+            emoji: 0,
         };
 
-
         let encoded = protobuf::encode_data(&data)?;
+        let our_relay = packet::node_last_byte(self.node_id);
+        let next_hop = packet::next_hop_for_dest(to, self.node_db.next_hop_hint(to), our_relay);
 
+        let channel_hash = self
+            .get_channel(channel_index)
+            .map(|c| c.hash())
+            .unwrap_or_else(|| self.primary_channel.hash());
 
-        let encrypted = self.primary_channel.encrypt(packet_id, self.node_id, &encoded)?;
-
+        let encrypted = if to != 0xFFFFFFFF && to != self.node_id {
+            if let (Some(recipient_pub), Some(sender_priv)) = (
+                self.node_db.get_public_key(to),
+                self.local_privkey.as_ref(),
+            ) {
+                let mut extra_nonce_bytes = [0u8; 4];
+                crate::rng::fill_random(&mut extra_nonce_bytes);
+                let extra_nonce = u32::from_le_bytes(extra_nonce_bytes);
+                pki_encrypt(
+                    recipient_pub,
+                    sender_priv,
+                    &encoded,
+                    packet_id,
+                    self.node_id,
+                    extra_nonce,
+                )
+                .or_else(|| self.encrypt_on_channel(channel_index, packet_id, &encoded))
+            } else {
+                self.encrypt_on_channel(channel_index, packet_id, &encoded)
+            }
+        } else {
+            self.encrypt_on_channel(channel_index, packet_id, &encoded)
+        }?;
 
         let lora_packet = packet::build_lora_packet(
             self.node_id,
             to,
             packet_id,
-            0,
+            channel_hash,
+            DEFAULT_HOP_LIMIT,
             DEFAULT_HOP_LIMIT,
             want_ack,
+            false,
+            next_hop,
+            our_relay,
             &encrypted,
         )?;
 
-        self.tx_count += 1;
+        self.packet_history.note_tx(
+            self.node_id,
+            packet_id,
+            next_hop,
+            DEFAULT_HOP_LIMIT,
+            our_relay,
+        );
 
+        if want_ack && to != 0xFFFFFFFF {
+            self.start_retransmit(self.node_id, packet_id, to, &lora_packet);
+        }
+
+        self.tx_count += 1;
         Some(lora_packet)
+    }
+
+
+    fn encrypt_on_channel(
+        &self,
+        index: u8,
+        packet_id: u32,
+        plaintext: &[u8],
+    ) -> Option<Vec<u8, 256>> {
+        match self.get_channel(index) {
+            Some(ch) => ch.encrypt(packet_id, self.node_id, plaintext),
+            None => self.primary_channel.encrypt(packet_id, self.node_id, plaintext),
+        }
+    }
+
+
+    fn create_ack(&mut self, original: &MeshPacket) -> Option<Vec<u8, 256>> {
+        let payload = protobuf::encode_routing_error(RoutingError::None)?;
+        let channel = self.channel_index_for_hash(original.channel_hash);
+        self.create_packet_ex(
+            original.from,
+            PortNum::Routing,
+            &payload,
+            false,
+            original.id,
+            0,
+            channel,
+        )
+    }
+
+
+    fn start_retransmit(
+        &mut self,
+        from: u32,
+        id: u32,
+        to: u32,
+        packet: &[u8],
+    ) {
+        self.stop_retransmit(from, id);
+        if self.pending_retx.len() >= 4 {
+            let _ = self.pending_retx.remove(0);
+        }
+        let mut copy = Vec::new();
+        if copy.extend_from_slice(packet).is_err() {
+            return;
+        }
+        let _ = self.pending_retx.push(PendingRetx {
+            from,
+            id,
+            to,
+            packet: copy,
+            tries_left: NUM_RELIABLE_RETX - 1,
+            next_tx_ms: 0,
+        });
+    }
+
+
+    fn stop_retransmit(&mut self, from: u32, id: u32) {
+        self.pending_retx.retain(|p| !(p.from == from && p.id == id));
+    }
+
+
+    fn poll_retransmit(&mut self, now_ms: u32) -> Option<Vec<u8, 256>> {
+        let mut due_index = None;
+        for (i, pending) in self.pending_retx.iter_mut().enumerate() {
+            if pending.next_tx_ms == 0 {
+                pending.next_tx_ms = now_ms.wrapping_add(RETX_INTERVAL_MS);
+                continue;
+            }
+            if now_ms.wrapping_sub(pending.next_tx_ms) < u32::MAX / 2 {
+                due_index = Some(i);
+                break;
+            }
+        }
+        let i = due_index?;
+        if self.pending_retx[i].tries_left == 0 {
+            let _ = self.pending_retx.remove(i);
+            return None;
+        }
+
+        let last_try = self.pending_retx[i].tries_left == 1;
+        if last_try {
+            packet::set_packet_next_hop(&mut self.pending_retx[i].packet, 0);
+            let dest = self.pending_retx[i].to;
+            self.node_db.clear_next_hop(dest);
+        }
+
+        let mut copy = Vec::new();
+        let _ = copy.extend_from_slice(&self.pending_retx[i].packet);
+        self.pending_retx[i].tries_left -= 1;
+        self.pending_retx[i].next_tx_ms = now_ms.wrapping_add(RETX_INTERVAL_MS);
+        Some(copy)
     }
 
 
@@ -708,7 +1197,7 @@ impl MeshtasticHandler {
         let payload_data = inner_payload?;
 
 
-        self.create_packet(to, port, &payload_data, want_ack)
+        self.create_packet_ex(to, port, &payload_data, want_ack, 0, 0, channel)
     }
 
 
@@ -905,6 +1394,12 @@ impl MeshtasticHandler {
         let _ = write_tag(7, WIRE_VARINT, &mut user);
         let _ = encode_varint(4, &mut user);
 
+        if let Some(pk) = self.node_db.get_public_key(self.node_id) {
+            let _ = write_tag(8, WIRE_LEN, &mut user);
+            let _ = encode_varint(pk.len() as u64, &mut user);
+            let _ = user.extend_from_slice(pk);
+        }
+
 
         let _ = write_tag(2, WIRE_LEN, &mut node_info);
         let _ = encode_varint(user.len() as u64, &mut node_info);
@@ -977,37 +1472,16 @@ impl MeshtasticHandler {
     }
 
 
-    pub fn handle_admin_message(&mut self, payload: &[u8]) -> Option<Vec<u8, MAX_MESSAGE_SIZE>> {
+    pub fn handle_admin_message(
+        &mut self,
+        payload: &[u8],
+        now_ms: u32,
+    ) -> Option<Vec<u8, MAX_MESSAGE_SIZE>> {
         if payload.is_empty() {
             return None;
         }
 
-
-        let tag = payload[0];
-        let field_num = tag >> 3;
-
-        match field_num {
-
-            1 => self.encode_privacy_myinfo(),
-
-
-            7 => self.encode_privacy_nodeinfo(),
-
-
-            5 => {
-
-                None
-            }
-
-
-            6 => {
-
-                None
-            }
-
-
-            _ => None,
-        }
+        self.handle_admin_request(payload, now_ms)
     }
 }
 
@@ -1436,5 +1910,126 @@ mod tests {
 
         let parsed = handler.parse_serial_frame(&frame).unwrap();
         assert_eq!(&parsed[..], payload);
+    }
+
+    #[test]
+    fn test_next_hop_learned_from_direct_ack() {
+        let mut sender = MeshtasticHandler::new(0x11111111);
+        let mut dest = MeshtasticHandler::new(0x22222222);
+
+        let packet = sender
+            .create_text_message(dest.node_id, "hello")
+            .expect("sender builds DM");
+        let parsed_tx = packet::parse_lora_packet(&packet).unwrap();
+        assert_eq!(parsed_tx.next_hop, 0);
+        assert_eq!(parsed_tx.relay_node, packet::node_last_byte(sender.node_id));
+
+        let decoded = dest
+            .process_lora_packet(&packet, -80, 5.0, 1_000)
+            .expect("dest decrypts DM");
+        match decoded.payload {
+            PacketPayload::Decoded(data) => {
+                assert_eq!(data.port, PortNum::TextMessage);
+                assert_eq!(&data.payload[..], b"hello");
+            }
+            _ => panic!("expected decoded payload"),
+        }
+
+        let ack = dest
+            .take_pending_lora_tx()
+            .expect("dest queued routing ACK");
+        let parsed_ack = packet::parse_lora_packet(&ack).unwrap();
+        assert_eq!(parsed_ack.to, sender.node_id);
+        assert_eq!(parsed_ack.from, dest.node_id);
+        assert_eq!(parsed_ack.relay_node, packet::node_last_byte(dest.node_id));
+
+        assert!(sender
+            .process_lora_packet(&ack, -80, 5.0, 1_100)
+            .is_some());
+        assert_eq!(
+            sender.node_db.next_hop_hint(dest.node_id),
+            packet::node_last_byte(dest.node_id)
+        );
+
+        let follow_up = sender
+            .create_text_message(dest.node_id, "again")
+            .expect("follow-up DM");
+        let parsed_follow = packet::parse_lora_packet(&follow_up).unwrap();
+        assert_eq!(
+            parsed_follow.next_hop,
+            packet::node_last_byte(dest.node_id)
+        );
+    }
+
+    #[test]
+    fn test_last_retransmit_clears_next_hop() {
+        let mut handler = MeshtasticHandler::new(0x11111111);
+        handler
+            .node_db
+            .set_next_hop(0x22222222, 0x22);
+        let packet = handler
+            .create_text_message(0x22222222, "retry")
+            .unwrap();
+        assert_eq!(packet::parse_lora_packet(&packet).unwrap().next_hop, 0x22);
+
+        let _ = handler.poll_tx(0);
+        let first = handler.poll_tx(RETX_INTERVAL_MS).expect("first retx");
+        assert_eq!(packet::parse_lora_packet(&first).unwrap().next_hop, 0x22);
+
+        let last = handler
+            .poll_tx(RETX_INTERVAL_MS.wrapping_mul(2))
+            .expect("flood fallback retx");
+        assert_eq!(packet::parse_lora_packet(&last).unwrap().next_hop, 0);
+        assert_eq!(handler.node_db.next_hop_hint(0x22222222), 0);
+    }
+
+    #[test]
+    fn test_secondary_channel_admin_get_set() {
+        let mut handler = MeshtasticHandler::new(0xABCDu32);
+        let mut session_key = *handler.admin_session.ensure_fresh(1_000);
+
+        let mut ch = Channel::new(1);
+        ch.set_name("Chat");
+        ch.set_key(&[0x02]);
+        ch.role = ChannelRole::Secondary;
+        let encoded_ch = protobuf::encode_channel(&ch).unwrap();
+
+        let mut encoder = ProtobufEncoder::<MAX_MESSAGE_SIZE>::new();
+        encoder.write_bytes_field(33, &encoded_ch);
+        encoder.write_bytes_field(101, &session_key);
+        let payload = encoder.finish();
+
+        let response = handler
+            .handle_admin_request(&payload, 1_000)
+            .expect("set channel accepted");
+        assert!(!response.is_empty());
+        assert_eq!(
+            handler.secondary_channels[0].as_ref().unwrap().name_str(),
+            "Chat"
+        );
+
+        let get = [0x08, 0x02];
+        let get_resp = handler
+            .handle_admin_request(&get, 1_000)
+            .expect("get channel");
+        assert!(get_resp.len() > 8);
+
+        let packet = handler
+            .create_packet_ex(
+                0xFFFFFFFF,
+                PortNum::TextMessage,
+                b"sec",
+                false,
+                0,
+                0,
+                1,
+            )
+            .unwrap();
+        let parsed = packet::parse_lora_packet(&packet).unwrap();
+        assert_eq!(
+            parsed.channel_hash,
+            handler.secondary_channels[0].as_ref().unwrap().hash()
+        );
+        let _ = session_key;
     }
 }

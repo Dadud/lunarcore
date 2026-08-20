@@ -454,15 +454,11 @@ impl LoRaPacket {
         }
 
 
-        if data.len() >= 20 {
-
-
-            let channel_hash = data[3];
-
-            if data.len() >= 12 {
-                let flags = data[11];
-                let hop_limit = flags & 0x07;
-                if hop_limit >= 1 && hop_limit <= 7 && channel_hash != 0 {
+        if data.len() >= 16 {
+            let from = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            if from != 0 {
+                let flags = data[12];
+                if (flags & 0x07) <= 7 {
                     return Protocol::Meshtastic;
                 }
             }
@@ -499,6 +495,37 @@ impl LoRaPacket {
         }
 
         Protocol::Unknown
+    }
+}
+
+
+pub fn can_relay_lora_packet(data: &[u8], protocol: Protocol) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+
+    if &data[..4] == b"TEST" {
+        return false;
+    }
+
+    match protocol {
+        Protocol::Meshtastic => {
+            if data.len() < 16 {
+                return false;
+            }
+            let hop_limit = data[12] & 0x07;
+            hop_limit > 0
+        }
+        Protocol::MeshCore => {
+            if data.len() < 9 {
+                return false;
+            }
+            let hop = (data[8] >> 4) & 0x0F;
+            hop > 0 && hop <= 7
+        }
+        Protocol::RNode => data.len() >= 18,
+        Protocol::Unknown => data.len() >= 8,
+        Protocol::AtCommand => false,
     }
 }
 

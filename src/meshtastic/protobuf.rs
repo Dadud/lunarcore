@@ -1,5 +1,6 @@
 use heapless::Vec;
 use super::{DataPayload, Position, User, PortNum, HardwareModel, Role, LocationSource, MAX_LORA_PAYLOAD};
+use super::channel::{Channel, ChannelRole};
 
 
 const WIRE_TYPE_VARINT: u8 = 0;
@@ -57,6 +58,7 @@ mod user_fields {
     pub const HW_MODEL: u32 = 5;
     pub const IS_LICENSED: u32 = 6;
     pub const ROLE: u32 = 7;
+    pub const PUBLIC_KEY: u32 = 8;
 }
 
 
@@ -497,11 +499,11 @@ pub fn encode_data(data: &DataPayload) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
     encoder.write_varint_field(data_fields::PORTNUM, data.port as u64);
     encoder.write_bytes_field(data_fields::PAYLOAD, &data.payload);
     encoder.write_bool_field(data_fields::WANT_RESPONSE, data.want_response);
-    encoder.write_varint_field(data_fields::DEST, data.dest as u64);
-    encoder.write_varint_field(data_fields::SOURCE, data.source as u64);
-    encoder.write_varint_field(data_fields::REQUEST_ID, data.request_id as u64);
-    encoder.write_varint_field(data_fields::REPLY_ID, data.reply_id as u64);
-    encoder.write_varint_field(data_fields::EMOJI, data.emoji as u64);
+    encoder.write_fixed32_field(data_fields::DEST, data.dest);
+    encoder.write_fixed32_field(data_fields::SOURCE, data.source);
+    encoder.write_fixed32_field(data_fields::REQUEST_ID, data.request_id);
+    encoder.write_fixed32_field(data_fields::REPLY_ID, data.reply_id);
+    encoder.write_fixed32_field(data_fields::EMOJI, data.emoji);
 
     Some(encoder.finish())
 }
@@ -546,6 +548,9 @@ pub fn encode_user(user: &User) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
     encoder.write_varint_field(user_fields::HW_MODEL, user.hw_model as u64);
     encoder.write_bool_field(user_fields::IS_LICENSED, user.is_licensed);
     encoder.write_varint_field(user_fields::ROLE, user.role as u64);
+    if let Some(pk) = user.public_key {
+        encoder.write_bytes_field(user_fields::PUBLIC_KEY, &pk);
+    }
 
     Some(encoder.finish())
 }
@@ -569,17 +574,32 @@ pub fn decode_data(data: &[u8]) -> Option<DataPayload> {
             data_fields::WANT_RESPONSE if wire_type == WIRE_TYPE_VARINT => {
                 result.want_response = decoder.read_varint()? != 0;
             }
+            data_fields::DEST if wire_type == WIRE_TYPE_32BIT => {
+                result.dest = decoder.read_fixed32()?;
+            }
             data_fields::DEST if wire_type == WIRE_TYPE_VARINT => {
                 result.dest = decoder.read_varint()? as u32;
+            }
+            data_fields::SOURCE if wire_type == WIRE_TYPE_32BIT => {
+                result.source = decoder.read_fixed32()?;
             }
             data_fields::SOURCE if wire_type == WIRE_TYPE_VARINT => {
                 result.source = decoder.read_varint()? as u32;
             }
+            data_fields::REQUEST_ID if wire_type == WIRE_TYPE_32BIT => {
+                result.request_id = decoder.read_fixed32()?;
+            }
             data_fields::REQUEST_ID if wire_type == WIRE_TYPE_VARINT => {
                 result.request_id = decoder.read_varint()? as u32;
             }
+            data_fields::REPLY_ID if wire_type == WIRE_TYPE_32BIT => {
+                result.reply_id = decoder.read_fixed32()?;
+            }
             data_fields::REPLY_ID if wire_type == WIRE_TYPE_VARINT => {
                 result.reply_id = decoder.read_varint()? as u32;
+            }
+            data_fields::EMOJI if wire_type == WIRE_TYPE_32BIT => {
+                result.emoji = decoder.read_fixed32()?;
             }
             data_fields::EMOJI if wire_type == WIRE_TYPE_VARINT => {
                 result.emoji = decoder.read_varint()? as u32;
@@ -680,6 +700,7 @@ pub fn decode_user(data: &[u8]) -> Option<User> {
         hw_model: HardwareModel::Unset,
         is_licensed: false,
         role: Role::Client,
+        public_key: None,
     };
 
     while decoder.has_more() {
@@ -740,6 +761,14 @@ pub fn decode_user(data: &[u8]) -> Option<User> {
                     10 => Role::TakTracker,
                     _ => Role::Client,
                 };
+            }
+            user_fields::PUBLIC_KEY if wire_type == WIRE_TYPE_LENGTH_DELIMITED => {
+                let bytes = decoder.read_bytes()?;
+                if bytes.len() == 32 {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(bytes);
+                    result.public_key = Some(pk);
+                }
             }
             _ => {
                 if !decoder.skip_field(wire_type) {
@@ -884,6 +913,112 @@ pub fn decode_routing_error(data: &[u8]) -> Option<RoutingError> {
     }
 
     None
+}
+
+
+mod channel_fields {
+    pub const INDEX: u32 = 1;
+    pub const SETTINGS: u32 = 2;
+    pub const ROLE: u32 = 3;
+}
+
+
+mod channel_settings_fields {
+    pub const CHANNEL_NUM: u32 = 1;
+    pub const PSK: u32 = 2;
+    pub const NAME: u32 = 3;
+    pub const ID: u32 = 4;
+    pub const UPLINK_ENABLED: u32 = 5;
+    pub const DOWNLINK_ENABLED: u32 = 6;
+    pub const MODULE_SETTINGS: u32 = 7;
+}
+
+
+pub fn encode_channel(channel: &Channel) -> Option<Vec<u8, 128>> {
+    let mut settings = ProtobufEncoder::<96>::new();
+    settings.write_bytes_field(channel_settings_fields::PSK, &channel.psk);
+    settings.write_string_field(channel_settings_fields::NAME, channel.name_str());
+    settings.write_bool_field(
+        channel_settings_fields::UPLINK_ENABLED,
+        channel.uplink_enabled,
+    );
+    settings.write_bool_field(
+        channel_settings_fields::DOWNLINK_ENABLED,
+        channel.downlink_enabled,
+    );
+    let settings_data = settings.finish();
+
+    let mut encoder = ProtobufEncoder::<128>::new();
+    encoder.write_varint_field(channel_fields::INDEX, channel.index as u64);
+    encoder.write_bytes_field(channel_fields::SETTINGS, &settings_data);
+    encoder.write_varint_field(channel_fields::ROLE, channel.role as u64);
+    Some(encoder.finish())
+}
+
+
+pub fn decode_channel(data: &[u8]) -> Option<Channel> {
+    let mut decoder = ProtobufDecoder::new(data);
+    let mut channel = Channel::new(0);
+    channel.role = ChannelRole::Disabled;
+
+    while decoder.has_more() {
+        let (field_number, wire_type) = decoder.read_tag()?;
+        match field_number {
+            channel_fields::INDEX if wire_type == WIRE_TYPE_VARINT => {
+                channel.index = decoder.read_varint()? as u8;
+            }
+            channel_fields::SETTINGS if wire_type == WIRE_TYPE_LENGTH_DELIMITED => {
+                let settings = decoder.read_bytes()?;
+                decode_channel_settings(&mut channel, settings)?;
+            }
+            channel_fields::ROLE if wire_type == WIRE_TYPE_VARINT => {
+                channel.role = match decoder.read_varint()? {
+                    1 => ChannelRole::Primary,
+                    2 => ChannelRole::Secondary,
+                    _ => ChannelRole::Disabled,
+                };
+            }
+            _ => {
+                if !decoder.skip_field(wire_type) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(channel)
+}
+
+
+fn decode_channel_settings(channel: &mut Channel, data: &[u8]) -> Option<()> {
+    let mut decoder = ProtobufDecoder::new(data);
+    while decoder.has_more() {
+        let (field_number, wire_type) = decoder.read_tag()?;
+        match field_number {
+            channel_settings_fields::PSK if wire_type == WIRE_TYPE_LENGTH_DELIMITED => {
+                let psk = decoder.read_bytes()?;
+                channel.set_key(psk);
+            }
+            channel_settings_fields::NAME if wire_type == WIRE_TYPE_LENGTH_DELIMITED => {
+                let name = decoder.read_bytes()?;
+                if let Ok(s) = core::str::from_utf8(name) {
+                    channel.set_name(s);
+                }
+            }
+            channel_settings_fields::UPLINK_ENABLED if wire_type == WIRE_TYPE_VARINT => {
+                channel.uplink_enabled = decoder.read_varint()? != 0;
+            }
+            channel_settings_fields::DOWNLINK_ENABLED if wire_type == WIRE_TYPE_VARINT => {
+                channel.downlink_enabled = decoder.read_varint()? != 0;
+            }
+            _ => {
+                if !decoder.skip_field(wire_type) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(())
 }
 
 
@@ -1305,24 +1440,6 @@ pub fn encode_from_radio_node_info(
 }
 
 
-mod channel_fields {
-    pub const INDEX: u32 = 1;
-    pub const SETTINGS: u32 = 2;
-    pub const ROLE: u32 = 3;
-}
-
-
-mod channel_settings_fields {
-    pub const CHANNEL_NUM: u32 = 1;
-    pub const PSK: u32 = 2;
-    pub const NAME: u32 = 3;
-    pub const ID: u32 = 4;
-    pub const UPLINK_ENABLED: u32 = 5;
-    pub const DOWNLINK_ENABLED: u32 = 6;
-    pub const MODULE_SETTINGS: u32 = 7;
-}
-
-
 pub fn encode_from_radio_channel(
     index: u8,
     channel: &super::Channel,
@@ -1369,6 +1486,7 @@ pub fn encode_from_radio_config_complete(config_id: u32) -> Option<heapless::Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{Channel, ChannelRole};
 
     #[test]
     fn test_varint_encoding() {
@@ -1406,6 +1524,37 @@ mod tests {
         assert_eq!(&decoded.payload[..], &original.payload[..]);
         assert_eq!(decoded.want_response, original.want_response);
         assert_eq!(decoded.source, original.source);
+        assert_eq!(decoded.dest, original.dest);
+    }
+
+    #[test]
+    fn test_data_request_id_fixed32() {
+        let original = DataPayload {
+            port: PortNum::Routing,
+            payload: Vec::new(),
+            request_id: 0xAABBCCDD,
+            ..Default::default()
+        };
+        let encoded = encode_data(&original).unwrap();
+        let decoded = decode_data(&encoded).unwrap();
+        assert_eq!(decoded.request_id, 0xAABBCCDD);
+    }
+
+    #[test]
+    fn test_channel_roundtrip() {
+        let mut original = Channel::new(2);
+        original.set_name("Chat");
+        original.set_key(&[0x02]);
+        original.role = ChannelRole::Secondary;
+        original.uplink_enabled = true;
+
+        let encoded = encode_channel(&original).unwrap();
+        let decoded = decode_channel(&encoded).unwrap();
+        assert_eq!(decoded.index, 2);
+        assert_eq!(decoded.name_str(), "Chat");
+        assert_eq!(decoded.role, ChannelRole::Secondary);
+        assert_eq!(&decoded.psk[..], &[0x02]);
+        assert!(decoded.uplink_enabled);
     }
 
     #[test]

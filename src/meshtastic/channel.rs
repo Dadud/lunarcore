@@ -16,6 +16,118 @@ pub const KEY_SIZE_256: usize = 32;
 pub const NONCE_SIZE: usize = 16;
 
 
+pub fn xor_bytes(data: &[u8]) -> u8 {
+    let mut h = 0u8;
+    for &b in data {
+        h ^= b;
+    }
+    h
+}
+
+
+pub fn modem_preset_display_name(preset: ModemPreset) -> &'static str {
+    match preset {
+        ModemPreset::LongSlow => "LongSlow",
+        ModemPreset::LongFast => "LongFast",
+        ModemPreset::LongModerate => "LongModerate",
+        ModemPreset::VeryLongSlow => "VeryLongSlow",
+        ModemPreset::MediumSlow => "MediumSlow",
+        ModemPreset::MediumFast => "MediumFast",
+        ModemPreset::ShortSlow => "ShortSlow",
+        ModemPreset::ShortFast => "ShortFast",
+        ModemPreset::ShortTurbo => "ShortTurbo",
+    }
+}
+
+
+pub fn resolve_channel_name(name: &str, modem_preset: ModemPreset, use_preset: bool) -> String {
+    if name.is_empty() {
+        if use_preset {
+            return modem_preset_display_name(modem_preset).to_string();
+        }
+        return "Custom".to_string();
+    }
+    name.to_string()
+}
+
+
+pub fn expand_psk(psk: &[u8]) -> Option<(Vec<u8, 32>, bool)> {
+    if psk.is_empty() {
+        return Some((Vec::new(), false));
+    }
+
+    if psk.len() == 1 {
+        let index = psk[0];
+        if index == 0 {
+            return Some((Vec::new(), false));
+        }
+        let mut key = mesh_kdf::DEFAULT_KEY;
+        key[15] = key[15].wrapping_add(index - 1);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&key).ok()?;
+        return Some((buf, true));
+    }
+
+    if psk.len() < 16 {
+        let mut key = [0u8; KEY_SIZE_128];
+        key[..psk.len()].copy_from_slice(psk);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&key).ok()?;
+        return Some((buf, true));
+    }
+
+    if psk.len() == 16 {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(psk).ok()?;
+        return Some((buf, true));
+    }
+
+    if psk.len() < 32 {
+        let mut key = [0u8; KEY_SIZE_256];
+        key[..psk.len()].copy_from_slice(psk);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&key).ok()?;
+        return Some((buf, true));
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&psk[..KEY_SIZE_256]).ok()?;
+    Some((buf, true))
+}
+
+
+pub fn channel_hash(name: &str, key_bytes: &[u8]) -> u8 {
+    let name_hash = xor_bytes(name.as_bytes());
+    if key_bytes.is_empty() {
+        return name_hash;
+    }
+    name_hash ^ xor_bytes(key_bytes)
+}
+
+
+pub fn match_default_preset_key(hash: u8) -> Option<ChannelKey> {
+    const PRESETS: [ModemPreset; 9] = [
+        ModemPreset::LongSlow,
+        ModemPreset::LongFast,
+        ModemPreset::LongModerate,
+        ModemPreset::VeryLongSlow,
+        ModemPreset::MediumSlow,
+        ModemPreset::MediumFast,
+        ModemPreset::ShortSlow,
+        ModemPreset::ShortFast,
+        ModemPreset::ShortTurbo,
+    ];
+
+    for preset in PRESETS {
+        let name = modem_preset_display_name(preset);
+        if channel_hash(name, mesh_kdf::DEFAULT_KEY.as_slice()) == hash {
+            return Some(ChannelKey::default_key());
+        }
+    }
+    None
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ModemPreset {
@@ -163,26 +275,32 @@ impl Drop for ChannelKey {
 
 impl ChannelKey {
 
-    pub fn from_bytes(key: &[u8]) -> Self {
-        match key.len() {
-            0 => ChannelKey::None,
-            1..=16 => {
+    pub fn from_psk(psk: &[u8]) -> Self {
+        let (expanded, encrypted) = expand_psk(psk).unwrap_or((Vec::new(), false));
+        if !encrypted {
+            return ChannelKey::None;
+        }
+        match expanded.len() {
+            KEY_SIZE_128 => {
                 let mut k = [0u8; KEY_SIZE_128];
-                k[..key.len()].copy_from_slice(key);
+                k.copy_from_slice(&expanded[..KEY_SIZE_128]);
                 ChannelKey::Aes128(k)
             }
             _ => {
                 let mut k = [0u8; KEY_SIZE_256];
-                let len = core::cmp::min(key.len(), KEY_SIZE_256);
-                k[..len].copy_from_slice(&key[..len]);
+                k.copy_from_slice(&expanded[..KEY_SIZE_256]);
                 ChannelKey::Aes256(k)
             }
         }
     }
 
+    pub fn from_bytes(key: &[u8]) -> Self {
+        Self::from_psk(key)
+    }
+
 
     pub fn default_key() -> Self {
-        ChannelKey::Aes128(mesh_kdf::DEFAULT_KEY)
+        ChannelKey::from_psk(&[0x01])
     }
 
 
@@ -226,6 +344,21 @@ impl core::fmt::Debug for ChannelKey {
 }
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ChannelRole {
+    Disabled = 0,
+    Primary = 1,
+    Secondary = 2,
+}
+
+impl Default for ChannelRole {
+    fn default() -> Self {
+        ChannelRole::Disabled
+    }
+}
+
+
 #[derive(Clone)]
 pub struct Channel {
 
@@ -234,6 +367,10 @@ pub struct Channel {
     pub name: Vec<u8, MAX_CHANNEL_NAME>,
 
     pub key: ChannelKey,
+
+    pub psk: Vec<u8, 32>,
+
+    pub role: ChannelRole,
 
     pub modem_preset: ModemPreset,
 
@@ -247,10 +384,18 @@ pub struct Channel {
 impl Channel {
 
     pub fn new(index: u8) -> Self {
+        let mut psk = Vec::new();
+        let _ = psk.push(0x01);
         Self {
             index,
             name: Vec::new(),
             key: ChannelKey::default_key(),
+            psk,
+            role: if index == 0 {
+                ChannelRole::Primary
+            } else {
+                ChannelRole::Secondary
+            },
             modem_preset: ModemPreset::default(),
             uplink_enabled: false,
             downlink_enabled: false,
@@ -260,9 +405,7 @@ impl Channel {
 
 
     pub fn primary() -> Self {
-        let mut ch = Self::new(0);
-        ch.name.extend_from_slice(b"Primary").ok();
-        ch
+        Self::new(0)
     }
 
 
@@ -270,14 +413,19 @@ impl Channel {
         self.name.clear();
         let len = core::cmp::min(name.len(), MAX_CHANNEL_NAME);
         self.name.extend_from_slice(&name.as_bytes()[..len]).ok();
-
-
-        self.key = ChannelKey::from_channel_name(name);
     }
 
 
     pub fn set_key(&mut self, key: &[u8]) {
-        self.key = ChannelKey::from_bytes(key);
+        self.psk.clear();
+        let len = core::cmp::min(key.len(), 32);
+        let _ = self.psk.extend_from_slice(&key[..len]);
+        self.key = ChannelKey::from_psk(key);
+    }
+
+
+    pub fn effective_name(&self) -> String {
+        resolve_channel_name(self.name_str(), self.modem_preset, true)
     }
 
 
@@ -348,17 +496,8 @@ impl Channel {
 
 
     pub fn hash(&self) -> u8 {
-
-        let key_bytes = self.key.as_bytes();
-        if key_bytes.is_empty() {
-            return 0;
-        }
-
-        let mut h: u8 = 0;
-        for &b in key_bytes {
-            h ^= b;
-        }
-        h
+        let name = self.effective_name();
+        channel_hash(&name, self.key.as_bytes())
     }
 
 
@@ -379,6 +518,7 @@ impl core::fmt::Debug for Channel {
             .field("index", &self.index)
             .field("name", &self.name_str())
             .field("key", &self.key)
+            .field("role", &self.role)
             .field("modem_preset", &self.modem_preset)
             .finish()
     }
@@ -625,26 +765,47 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_decrypt_roundtrip() {
+    fn test_match_default_preset_longfast() {
+        assert!(match_default_preset_key(8).is_some());
+        assert!(match_default_preset_key(0xFF).is_none());
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_multiblock_default_key() {
         let ch = Channel::primary();
-        let plaintext = b"Hello, Meshtastic!";
-        let packet_id = 0x12345678;
-        let sender = 0xDEADBEEF;
+        let plaintext = [0xABu8; 48];
+        let packet_id = 0x11223344;
+        let sender = 0x55667788;
 
-        let ciphertext = ch.encrypt(packet_id, sender, plaintext).unwrap();
-        assert_ne!(&ciphertext[..], plaintext);
-
+        let ciphertext = ch.encrypt(packet_id, sender, &plaintext).unwrap();
         let decrypted = ch.decrypt(packet_id, sender, &ciphertext).unwrap();
-        assert_eq!(&decrypted[..], plaintext);
+        assert_eq!(&decrypted[..], &plaintext);
+    }
+
+    #[test]
+    fn test_default_longfast_channel_hash() {
+        let ch = Channel::primary();
+        assert_eq!(ch.effective_name(), "LongFast");
+        assert_eq!(ch.hash(), 8);
+    }
+
+    #[test]
+    fn test_psk_shorthand_expansion() {
+        let key = ChannelKey::from_psk(&[0x01]);
+        assert!(matches!(key, ChannelKey::Aes128(_)));
+
+        let key2 = ChannelKey::from_psk(&[0x03]);
+        let bytes = key2.as_bytes();
+        assert_eq!(bytes[15], 0x03);
     }
 
     #[test]
     fn test_channel_hash() {
         let mut ch = Channel::new(0);
-        ch.set_key(&[0x01, 0x02, 0x03, 0x04]);
-
-
-        assert_eq!(ch.hash(), 0x04);
+        ch.set_name("Test");
+        ch.set_key(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10]);
+        let expected = channel_hash(&ch.effective_name(), ch.key.as_bytes());
+        assert_eq!(ch.hash(), expected);
     }
 
     #[test]

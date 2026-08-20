@@ -1,6 +1,5 @@
 use heapless::Vec;
-use super::{MeshPacket, PacketPayload, Priority, LORA_HEADER_SIZE, MAX_LORA_PAYLOAD, MIC_SIZE, DEFAULT_HOP_LIMIT};
-use crate::crypto::sha256::Sha256;
+use super::{MeshPacket, PacketPayload, Priority, LORA_HEADER_SIZE, MAX_LORA_PAYLOAD, DEFAULT_HOP_LIMIT};
 
 
 const OFFSET_TO: usize = 0;
@@ -8,60 +7,53 @@ const OFFSET_FROM: usize = 4;
 const OFFSET_ID: usize = 8;
 const OFFSET_FLAGS: usize = 12;
 const OFFSET_CHANNEL_HASH: usize = 13;
+const OFFSET_NEXT_HOP: usize = 14;
+const OFFSET_RELAY_NODE: usize = 15;
 
 
-const FLAG_WANT_ACK: u8 = 0x01;
-const FLAG_HOP_LIMIT_MASK: u8 = 0x0E;
-const FLAG_HOP_LIMIT_SHIFT: u8 = 1;
-const FLAG_CHANNEL_MASK: u8 = 0xF0;
-const FLAG_CHANNEL_SHIFT: u8 = 4;
+const FLAG_HOP_LIMIT_MASK: u8 = 0x07;
+const FLAG_WANT_ACK: u8 = 0x08;
+const FLAG_VIA_MQTT: u8 = 0x10;
+const FLAG_HOP_START_MASK: u8 = 0xE0;
+const FLAG_HOP_START_SHIFT: u8 = 5;
 
 
 pub fn parse_lora_packet(data: &[u8]) -> Option<MeshPacket> {
-
-    if data.len() < LORA_HEADER_SIZE + MIC_SIZE {
+    if data.len() < LORA_HEADER_SIZE {
         return None;
     }
-
 
     let to = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     let from = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
     let id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
     let flags = data[OFFSET_FLAGS];
     let channel_hash = data[OFFSET_CHANNEL_HASH];
+    let next_hop = data[OFFSET_NEXT_HOP];
+    let relay_node = data[OFFSET_RELAY_NODE];
 
-
+    let hop_limit = flags & FLAG_HOP_LIMIT_MASK;
     let want_ack = (flags & FLAG_WANT_ACK) != 0;
-    let hop_limit = (flags & FLAG_HOP_LIMIT_MASK) >> FLAG_HOP_LIMIT_SHIFT;
-    let channel = (flags & FLAG_CHANNEL_MASK) >> FLAG_CHANNEL_SHIFT;
-
-
-    let payload_end = data.len() - MIC_SIZE;
-    let payload_start = LORA_HEADER_SIZE;
-
-    if payload_end <= payload_start {
-        return None;
-    }
+    let via_mqtt = (flags & FLAG_VIA_MQTT) != 0;
+    let hop_start = (flags & FLAG_HOP_START_MASK) >> FLAG_HOP_START_SHIFT;
 
     let mut payload_data = Vec::new();
-    payload_data.extend_from_slice(&data[payload_start..payload_end]).ok()?;
-
-
-    let received_mic = &data[payload_end..];
-    let computed_mic = compute_mic(&data[..payload_end]);
-
-    if !constant_time_eq(received_mic, &computed_mic) {
-
-
+    if data.len() > LORA_HEADER_SIZE {
+        payload_data.extend_from_slice(&data[LORA_HEADER_SIZE..]).ok()?;
     }
 
     Some(MeshPacket {
         from,
         to,
-        channel,
+        channel: channel_hash,
+        channel_hash,
         id,
         hop_limit,
+        hop_start,
         want_ack,
+        pki_encrypted: false,
+        via_mqtt,
+        next_hop: if hop_start == 0 { 0 } else { next_hop },
+        relay_node: if hop_start == 0 { 0 } else { relay_node },
         priority: Priority::Default,
         rx_time: 0,
         rx_snr: 0.0,
@@ -75,73 +67,37 @@ pub fn build_lora_packet(
     from: u32,
     to: u32,
     id: u32,
-    channel: u8,
+    channel_hash: u8,
     hop_limit: u8,
+    hop_start: u8,
     want_ack: bool,
+    via_mqtt: bool,
+    next_hop: u8,
+    relay_node: u8,
     payload: &[u8],
 ) -> Option<Vec<u8, 256>> {
-    let total_len = LORA_HEADER_SIZE + payload.len() + MIC_SIZE;
+    let total_len = LORA_HEADER_SIZE + payload.len();
     if total_len > 256 || payload.len() > MAX_LORA_PAYLOAD {
         return None;
     }
 
     let mut packet = Vec::new();
 
-
     packet.extend_from_slice(&to.to_le_bytes()).ok()?;
     packet.extend_from_slice(&from.to_le_bytes()).ok()?;
     packet.extend_from_slice(&id.to_le_bytes()).ok()?;
 
-
-    let flags = (if want_ack { FLAG_WANT_ACK } else { 0 })
-        | ((hop_limit & 0x07) << FLAG_HOP_LIMIT_SHIFT)
-        | ((channel & 0x0F) << FLAG_CHANNEL_SHIFT);
+    let flags = (hop_limit & FLAG_HOP_LIMIT_MASK)
+        | (if want_ack { FLAG_WANT_ACK } else { 0 })
+        | (if via_mqtt { FLAG_VIA_MQTT } else { 0 })
+        | ((hop_start & 0x07) << FLAG_HOP_START_SHIFT);
     packet.push(flags).ok()?;
-
-
-    packet.push(compute_channel_hash(channel)).ok()?;
-
-
-    packet.push(0).ok()?;
-    packet.push(0).ok()?;
-
-
+    packet.push(channel_hash).ok()?;
+    packet.push(next_hop).ok()?;
+    packet.push(relay_node).ok()?;
     packet.extend_from_slice(payload).ok()?;
 
-
-    let mic = compute_mic(&packet);
-    packet.extend_from_slice(&mic).ok()?;
-
     Some(packet)
-}
-
-
-fn compute_mic(data: &[u8]) -> [u8; MIC_SIZE] {
-    let hash = Sha256::hash(data);
-    let mut mic = [0u8; MIC_SIZE];
-    mic.copy_from_slice(&hash[..MIC_SIZE]);
-    mic
-}
-
-
-fn compute_channel_hash(channel: u8) -> u8 {
-
-
-    let mut h = channel.wrapping_mul(0x9E).wrapping_add(0x37);
-    h ^= h >> 4;
-    h.wrapping_mul(0xB5)
-}
-
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 
@@ -214,6 +170,56 @@ pub enum RoutingDecision {
 }
 
 
+pub fn node_last_byte(node_id: u32) -> u8 {
+    (node_id & 0xFF) as u8
+}
+
+
+pub fn hops_away(packet: &MeshPacket) -> u8 {
+    if packet.hop_start == 0 {
+        return 0;
+    }
+    packet.hop_start.saturating_sub(packet.hop_limit)
+}
+
+
+pub fn next_hop_for_dest(to: u32, known_next_hop: u8, relay_node: u8) -> u8 {
+    if to == 0xFFFFFFFF || known_next_hop == 0 || known_next_hop == relay_node {
+        0
+    } else {
+        known_next_hop
+    }
+}
+
+
+pub fn set_packet_next_hop(data: &mut [u8], next_hop: u8) {
+    if data.len() > OFFSET_NEXT_HOP {
+        data[OFFSET_NEXT_HOP] = next_hop;
+    }
+}
+
+
+pub fn should_relay_packet(packet: &MeshPacket, our_node_id: u32) -> bool {
+    if packet.hop_limit == 0 {
+        return false;
+    }
+
+    if packet.to == our_node_id {
+        return false;
+    }
+
+    if packet.hop_start == 0 {
+        return true;
+    }
+
+    if packet.next_hop == 0 || packet.next_hop == node_last_byte(our_node_id) {
+        return true;
+    }
+
+    false
+}
+
+
 pub fn route_packet(packet: &MeshPacket, our_node_id: u32, cache: &mut PacketCache, timestamp: u32) -> RoutingDecision {
 
     if cache.check_and_add(packet.from, packet.id, timestamp) {
@@ -241,6 +247,51 @@ pub fn route_packet(packet: &MeshPacket, our_node_id: u32, cache: &mut PacketCac
 }
 
 
+pub fn prepare_relay_packet(data: &[u8], our_node_id: u32) -> Option<Vec<u8, 256>> {
+    let packet = parse_lora_packet(data)?;
+    if !should_relay_packet(&packet, our_node_id) {
+        return None;
+    }
+
+    let payload = match &packet.payload {
+        PacketPayload::Encrypted(payload) => payload.as_slice(),
+        PacketPayload::Decoded(_) => return None,
+    };
+
+    let relay_next_hop = if packet.next_hop == 0 {
+        0
+    } else {
+        packet.next_hop
+    };
+
+    build_lora_packet(
+        packet.from,
+        packet.to,
+        packet.id,
+        packet.channel_hash,
+        packet.hop_limit - 1,
+        packet.hop_start,
+        packet.want_ack,
+        packet.via_mqtt,
+        relay_next_hop,
+        node_last_byte(our_node_id),
+        payload,
+    )
+}
+
+
+pub fn can_relay_packet(data: &[u8], our_node_id: u32) -> bool {
+    if data.len() < LORA_HEADER_SIZE {
+        return false;
+    }
+    if let Some(packet) = parse_lora_packet(data) {
+        should_relay_packet(&packet, our_node_id)
+    } else {
+        false
+    }
+}
+
+
 pub fn create_forward_packet(original: &MeshPacket, payload: &[u8]) -> Option<Vec<u8, 256>> {
     if original.hop_limit == 0 {
         return None;
@@ -250,9 +301,13 @@ pub fn create_forward_packet(original: &MeshPacket, payload: &[u8]) -> Option<Ve
         original.from,
         original.to,
         original.id,
-        original.channel,
+        original.channel_hash,
         original.hop_limit - 1,
+        original.hop_start,
         original.want_ack,
+        original.via_mqtt,
+        original.next_hop,
+        original.relay_node,
         payload,
     )
 }
@@ -439,19 +494,37 @@ mod tests {
         let from = 0x12345678;
         let to = 0xFFFFFFFF;
         let id = 0xABCDEF01;
-        let channel = 0;
+        let channel_hash = 8;
         let hop_limit = 3;
+        let hop_start = 3;
         let want_ack = true;
         let payload = [0x01, 0x02, 0x03, 0x04, 0x05];
 
-        let packet = build_lora_packet(from, to, id, channel, hop_limit, want_ack, &payload).unwrap();
+        let packet = build_lora_packet(
+            from,
+            to,
+            id,
+            channel_hash,
+            hop_limit,
+            hop_start,
+            want_ack,
+            false,
+            0,
+            0,
+            &payload,
+        )
+        .unwrap();
+
+        assert_eq!(packet.len(), LORA_HEADER_SIZE + payload.len());
 
         let parsed = parse_lora_packet(&packet).unwrap();
         assert_eq!(parsed.from, from);
         assert_eq!(parsed.to, to);
         assert_eq!(parsed.id, id);
-        assert_eq!(parsed.channel, channel);
+        assert_eq!(parsed.channel, channel_hash);
+        assert_eq!(parsed.channel_hash, channel_hash);
         assert_eq!(parsed.hop_limit, hop_limit);
+        assert_eq!(parsed.hop_start, hop_start);
         assert_eq!(parsed.want_ack, want_ack);
 
         if let PacketPayload::Encrypted(ref data) = parsed.payload {
@@ -547,24 +620,77 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));
-        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2, 4]));
-        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2]));
+    fn test_prepare_relay_decrements_hop() {
+        let payload = [0xAAu8; 8];
+        let original = build_lora_packet(
+            0x11111111,
+            0xFFFFFFFF,
+            0x22222222,
+            8,
+            3,
+            3,
+            false,
+            false,
+            0,
+            0,
+            &payload,
+        )
+        .unwrap();
+
+        let relay = prepare_relay_packet(&original, 0x12345678).unwrap();
+        let parsed = parse_lora_packet(&relay).unwrap();
+        assert_eq!(parsed.hop_limit, 2);
+        assert_eq!(parsed.relay_node, 0x78);
     }
 
     #[test]
-    fn test_mic_computation() {
-        let data = [0x01, 0x02, 0x03, 0x04];
-        let mic = compute_mic(&data);
-        assert_eq!(mic.len(), MIC_SIZE);
+    fn test_directed_relay_filters_wrong_next_hop() {
+        let payload = [0xBBu8; 8];
+        let our_id = 0x12345678u32;
+        let original = build_lora_packet(
+            0x11111111,
+            0x22222222,
+            0x33333333,
+            8,
+            3,
+            3,
+            false,
+            false,
+            0x42,
+            0,
+            &payload,
+        )
+        .unwrap();
 
+        assert!(prepare_relay_packet(&original, our_id).is_none());
 
-        let mic2 = compute_mic(&data);
-        assert_eq!(mic, mic2);
+        let for_us = build_lora_packet(
+            0x11111111,
+            0x22222222,
+            0x33333334,
+            8,
+            3,
+            3,
+            false,
+            false,
+            node_last_byte(our_id),
+            0,
+            &payload,
+        )
+        .unwrap();
+        assert!(prepare_relay_packet(&for_us, our_id).is_some());
+    }
 
-
-        let mic3 = compute_mic(&[0x05, 0x06, 0x07, 0x08]);
-        assert_ne!(mic, mic3);
+    #[test]
+    fn test_hops_away_and_next_hop_preference() {
+        let packet = MeshPacket {
+            hop_start: 3,
+            hop_limit: 1,
+            ..Default::default()
+        };
+        assert_eq!(hops_away(&packet), 2);
+        assert_eq!(next_hop_for_dest(0xFFFFFFFF, 0x42, 0x01), 0);
+        assert_eq!(next_hop_for_dest(0x22222222, 0x42, 0x42), 0);
+        assert_eq!(next_hop_for_dest(0x22222222, 0x42, 0x01), 0x42);
     }
 }

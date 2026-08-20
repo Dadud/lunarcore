@@ -508,7 +508,7 @@ impl Aes128 {
 
     #[inline]
     fn increment_counter(counter: &mut [u8; 16]) {
-        for i in (0..16).rev() {
+        for i in (12..16).rev() {
             counter[i] = counter[i].wrapping_add(1);
             if counter[i] != 0 {
                 break;
@@ -740,7 +740,7 @@ fn add_round_key_256(state: &mut [u8; 16], round_key: &[u8]) {
 
 #[inline]
 fn increment_counter_256(counter: &mut [u8; 16]) {
-    for i in (0..16).rev() {
+    for i in (12..16).rev() {
         counter[i] = counter[i].wrapping_add(1);
         if counter[i] != 0 {
             break;
@@ -983,7 +983,7 @@ impl Aes128Ct {
 
     #[inline]
     fn increment_counter(counter: &mut [u8; 16]) {
-        for i in (0..16).rev() {
+        for i in (12..16).rev() {
             counter[i] = counter[i].wrapping_add(1);
             if counter[i] != 0 {
                 break;
@@ -1185,6 +1185,25 @@ mod tests {
 
         cipher.decrypt_ctr(&nonce, &mut data[..len]);
         assert_eq!(&data[..len], plaintext);
+    }
+
+    #[test]
+    fn test_ctr_mode_multi_block_counter() {
+        let key: [u8; 16] = [0x2b; 16];
+        let mut nonce: [u8; 16] = [0x00; 16];
+        nonce[..4].copy_from_slice(&0x01020304u32.to_le_bytes());
+        nonce[8..12].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+
+        let plaintext = [0xAAu8; 32];
+        let cipher = Aes128::new(&key);
+
+        let mut encrypted = plaintext;
+        cipher.encrypt_ctr(&nonce, &mut encrypted);
+        assert_ne!(encrypted, plaintext);
+
+        let mut decrypted = encrypted;
+        cipher.decrypt_ctr(&nonce, &mut decrypted);
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]

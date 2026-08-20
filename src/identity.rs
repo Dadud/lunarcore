@@ -127,6 +127,16 @@ impl Identity {
     }
 
 
+    pub fn encryption_private(&self) -> [u8; 32] {
+        self.encryption_key
+    }
+
+
+    pub fn signing_private(&self) -> &[u8; 32] {
+        &self.signing_key
+    }
+
+
     pub fn encrypt_for_storage(&self, storage_key: &[u8; 32]) -> EncryptedIdentity {
 
         let mut plaintext = [0u8; 128];
@@ -204,9 +214,7 @@ impl Identity {
     }
 
 
-    pub fn export_seed(&self) -> [u8; SEED_SIZE] {
-
-
+    pub fn export_signing_key(&self) -> [u8; 32] {
         self.signing_key
     }
 }
@@ -344,14 +352,14 @@ impl IdentityManager {
 
             unsafe {
                 let mut handle: nvs_handle_t = 0;
-                let namespace = b"lunar\0".as_ptr();
+                let namespace = b"lunarcore\0".as_ptr();
 
                 let ret = nvs_open(namespace, nvs_open_mode_t_NVS_READONLY, &mut handle);
                 if ret != 0 {
                     return None;
                 }
 
-                let key = b"identity\0".as_ptr();
+                let key = b"id_v2\0".as_ptr();
                 let mut size: usize = 128 + NONCE_SIZE + 32;
                 let mut bytes = [0u8; 128 + NONCE_SIZE + 32];
 
@@ -383,7 +391,7 @@ impl IdentityManager {
             use esp_idf_sys::*;
 
             let mut handle: nvs_handle_t = 0;
-            let namespace = b"lunar\0".as_ptr();
+            let namespace = b"lunarcore\0".as_ptr();
 
             let ret = nvs_open(namespace, nvs_open_mode_t_NVS_READWRITE, &mut handle);
             if ret != 0 {

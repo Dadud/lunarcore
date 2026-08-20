@@ -10,6 +10,13 @@ mod display;
 mod transport;
 mod session;
 mod onion;
+mod device;
+mod wifi;
+mod contact;
+mod power;
+mod ota;
+mod packet_id;
+mod identity;
 
 
 use esp_idf_hal::delay::FreeRtos;
@@ -25,18 +32,22 @@ use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
 use esp_idf_hal::adc::oneshot::{AdcDriver, AdcChannelDriver};
 use display::StatusDisplay;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
-use crypto::sha256::Sha256;
 use heapless::Vec;
 
 use sx1262::{Sx1262, RadioConfig, RadioState, RadioError};
 use protocol::{Frame, FrameParser, Command, MAX_FRAME_SIZE};
-use protocol_router::{Protocol, ProtocolRouter, ProtocolDetector, TransportType};
+use protocol_router::{Protocol, ProtocolRouter, ProtocolDetector, TransportType, can_relay_lora_packet};
 use meshtastic::{MeshtasticParser, MeshtasticFrame, MeshtasticHandler};
 use rnode::{KissParser, KissFrame, RNodeHandler, KissCommand};
 use ble::{BleManager, ServiceType};
 use session::{SessionManager, Session, SessionParams, SessionError, MessageHeader};
 use onion::{OnionRouter, OnionRoute, RouteHop, OnionPacket, OnionError, RouteBuilder};
 use transport::{WirePacket, AddressTranslator, UniversalAddress};
+use device::{DeviceIdentity, load_wifi_setting, save_wifi_setting};
+use wifi::{WifiManager, WifiConfig, WifiMode};
+use contact::ContactStore;
+use power::{PowerManager, PowerMode};
+use ota::OtaManager;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +80,7 @@ pub enum DecryptResult {
 }
 
 
-const FIRMWARE_VERSION: &str = "LunarCore v1.0.0";
+const FIRMWARE_VERSION: &str = concat!("LunarCore v", env!("CARGO_PKG_VERSION"));
 
 
 const BAUD_RATE: u32 = 115200;
@@ -149,228 +160,6 @@ static LAST_ACTIVITY: AtomicU32 = AtomicU32::new(0);
 
 
 static ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
-
-
-#[derive(Clone)]
-struct NodeIdentity {
-
-    node_id: u32,
-
-    mac_address: [u8; 6],
-
-    hardware_serial: [u8; 8],
-
-    public_key: [u8; 32],
-
-    private_key: [u8; 32],
-}
-
-
-const NVS_NAMESPACE: &str = "lunarcore";
-const NVS_KEY_NODE_ID: &str = "node_id";
-const NVS_KEY_PRIVATE_KEY: &str = "priv_key";
-
-impl NodeIdentity {
-
-
-    fn from_hardware() -> Self {
-
-        let mac_address = Self::read_mac_address();
-
-
-        let hardware_serial = Self::read_hardware_serial();
-
-
-        let (node_id, private_key) = Self::load_or_create_identity(&hardware_serial);
-
-
-        let public_key = crypto::ed25519::Ed25519::public_key(&private_key);
-
-        Self {
-            node_id,
-            mac_address,
-            hardware_serial,
-            public_key,
-            private_key,
-        }
-    }
-
-
-    fn load_or_create_identity(hardware_serial: &[u8; 8]) -> (u32, [u8; 32]) {
-
-        let nvs_result = unsafe {
-            let mut handle: esp_idf_sys::nvs_handle_t = 0;
-            let namespace = core::ffi::CStr::from_bytes_with_nul(b"lunarcore\0").unwrap();
-            let err = esp_idf_sys::nvs_open(
-                namespace.as_ptr(),
-                esp_idf_sys::nvs_open_mode_t_NVS_READWRITE,
-                &mut handle,
-            );
-            if err == esp_idf_sys::ESP_OK {
-                Some(handle)
-            } else {
-
-                esp_idf_sys::nvs_flash_init();
-                let err = esp_idf_sys::nvs_open(
-                    namespace.as_ptr(),
-                    esp_idf_sys::nvs_open_mode_t_NVS_READWRITE,
-                    &mut handle,
-                );
-                if err == esp_idf_sys::ESP_OK {
-                    Some(handle)
-                } else {
-                    None
-                }
-            }
-        };
-
-        if let Some(handle) = nvs_result {
-
-            let mut node_id: u32 = 0;
-            let mut private_key = [0u8; 32];
-            let mut key_len: usize = 32;
-
-            let node_id_key = core::ffi::CStr::from_bytes_with_nul(b"node_id\0").unwrap();
-            let priv_key_key = core::ffi::CStr::from_bytes_with_nul(b"priv_key\0").unwrap();
-
-            let has_node_id = unsafe {
-                esp_idf_sys::nvs_get_u32(handle, node_id_key.as_ptr(), &mut node_id) == esp_idf_sys::ESP_OK
-            };
-
-            let has_private_key = unsafe {
-                esp_idf_sys::nvs_get_blob(
-                    handle,
-                    priv_key_key.as_ptr(),
-                    private_key.as_mut_ptr() as *mut _,
-                    &mut key_len,
-                ) == esp_idf_sys::ESP_OK && key_len == 32
-            };
-
-            if has_node_id && has_private_key {
-
-                log::info!("Loaded existing node identity from NVS");
-                unsafe { esp_idf_sys::nvs_close(handle); }
-                return (node_id, private_key);
-            }
-
-
-            log::info!("Creating new random node identity (privacy-first)");
-
-
-            node_id = Self::generate_random_node_id();
-
-
-            private_key = Self::generate_random_private_key(hardware_serial);
-
-
-            unsafe {
-                esp_idf_sys::nvs_set_u32(handle, node_id_key.as_ptr(), node_id);
-                esp_idf_sys::nvs_set_blob(
-                    handle,
-                    priv_key_key.as_ptr(),
-                    private_key.as_ptr() as *const _,
-                    32,
-                );
-                esp_idf_sys::nvs_commit(handle);
-                esp_idf_sys::nvs_close(handle);
-            }
-
-            log::info!("Stored new identity in NVS");
-            (node_id, private_key)
-        } else {
-
-            log::warn!("NVS not available, using ephemeral identity");
-            let node_id = Self::generate_random_node_id();
-            let private_key = Self::generate_random_private_key(hardware_serial);
-            (node_id, private_key)
-        }
-    }
-
-
-    fn generate_random_node_id() -> u32 {
-        let mut random_bytes = [0u8; 4];
-        unsafe {
-            esp_idf_sys::esp_fill_random(random_bytes.as_mut_ptr() as *mut _, 4);
-        }
-
-        let id = u32::from_le_bytes(random_bytes);
-        id | 0x80000000
-    }
-
-
-    fn generate_random_private_key(hardware_serial: &[u8; 8]) -> [u8; 32] {
-        let mut random_bytes = [0u8; 32];
-        unsafe {
-            esp_idf_sys::esp_fill_random(random_bytes.as_mut_ptr() as *mut _, 32);
-        }
-
-
-        let mut seed_input = [0u8; 40];
-        seed_input[0..32].copy_from_slice(&random_bytes);
-        seed_input[32..40].copy_from_slice(hardware_serial);
-
-
-        let mut private_key = Sha256::hash(&seed_input);
-
-
-        private_key[0] &= 248;
-        private_key[31] &= 127;
-        private_key[31] |= 64;
-
-        private_key
-    }
-
-
-    #[allow(dead_code)]
-    fn factory_reset() -> Option<Self> {
-
-        unsafe {
-            let namespace = core::ffi::CStr::from_bytes_with_nul(b"lunarcore\0").unwrap();
-            esp_idf_sys::nvs_flash_erase_partition(namespace.as_ptr());
-        }
-
-        log::info!("Factory reset: erased old identity, generating new one");
-
-
-        Some(Self::from_hardware())
-    }
-
-
-    fn read_mac_address() -> [u8; 6] {
-        let mut mac = [0u8; 6];
-
-        unsafe {
-
-            esp_idf_sys::esp_efuse_mac_get_default(mac.as_mut_ptr());
-        }
-
-        mac
-    }
-
-
-    fn read_hardware_serial() -> [u8; 8] {
-        let mut serial = [0u8; 8];
-
-        unsafe {
-
-
-            let efuse_base: *const u32 = 0x6001A044 as *const u32;
-            let word0 = core::ptr::read_volatile(efuse_base);
-            let word1 = core::ptr::read_volatile(efuse_base.add(1));
-
-            serial[0..4].copy_from_slice(&word0.to_le_bytes());
-            serial[4..8].copy_from_slice(&word1.to_le_bytes());
-        }
-
-        serial
-    }
-
-
-    fn x25519_pubkey(&self) -> [u8; 32] {
-        use crypto::x25519;
-        x25519::x25519_base(&self.private_key)
-    }
-}
 
 
 struct BatteryState {
@@ -657,14 +446,22 @@ impl DeduplicatorRing {
     fn check_and_insert(&mut self, data: &[u8]) -> bool {
         let hash = Self::fingerprint(data);
 
+        let slots = if self.count < DEDUP_RING_SIZE {
+            self.count
+        } else {
+            DEDUP_RING_SIZE
+        };
 
-        let entries = self.count.min(DEDUP_RING_SIZE);
-        for i in 0..entries {
-            if self.hashes[i] == hash {
+        for i in 0..slots {
+            let idx = if self.count < DEDUP_RING_SIZE {
+                i
+            } else {
+                (self.head + DEDUP_RING_SIZE - 1 - i) % DEDUP_RING_SIZE
+            };
+            if self.hashes[idx] == hash {
                 return false;
             }
         }
-
 
         self.hashes[self.head] = hash;
         self.head = (self.head + 1) % DEDUP_RING_SIZE;
@@ -708,7 +505,19 @@ struct LunarCore<SPI, NSS, RESET, BUSY, DIO1> {
 
     stats: Stats,
 
-    identity: NodeIdentity,
+    identity: DeviceIdentity,
+
+    wifi: WifiManager,
+
+    wifi_enabled: bool,
+
+    wifi_protocol: Protocol,
+
+    power: PowerManager,
+
+    ota: OtaManager,
+
+    contacts: ContactStore,
 
     battery: BatteryState,
 
@@ -717,6 +526,8 @@ struct LunarCore<SPI, NSS, RESET, BUSY, DIO1> {
     rx_active: bool,
 
     serial_protocol: Protocol,
+
+    ble_protocol: Protocol,
 
     vext_enabled: bool,
 
@@ -753,38 +564,52 @@ where
     BUSY: embedded_hal::digital::InputPin,
     DIO1: embedded_hal::digital::InputPin,
 {
-    fn new(radio: Sx1262<SPI, NSS, RESET, BUSY, DIO1>, identity: NodeIdentity) -> Self {
+    fn new(radio: Sx1262<SPI, NSS, RESET, BUSY, DIO1>, identity: DeviceIdentity) -> Self {
         let node_id = identity.node_id;
 
-
-        let x25519_private = {
-            let mut key = identity.private_key;
-
-            key[0] &= 248;
-            key[31] &= 127;
-            key[31] |= 64;
-            key
-        };
-
-
-        let onion_router = OnionRouter::new(x25519_private);
-
+        let onion_router = OnionRouter::new(identity.encryption_private);
 
         let our_address = AddressTranslator::from_public_key(&identity.public_key);
+
+        let mut session_manager = SessionManager::new();
+        let _ = session_manager.load_from_nvs();
+
+        let mut ota = OtaManager::new();
+        let _ = ota.add_trusted_key(&identity.public_key);
+
+        let mut contacts = ContactStore::new();
+        let _ = contacts.load_from_nvs();
+
+        let mut wifi = WifiManager::new();
+        wifi.configure_device_psk(&identity.mac_address);
+
+        let mut power = PowerManager::new();
+        let _ = power.init();
+
+        let mut meshtastic = MeshtasticHandler::new(node_id);
+        meshtastic.set_device_keys(&identity.encryption_private, &identity.encryption_public);
+        let _ = meshtastic.load_node_db();
 
         Self {
             radio,
             router: ProtocolRouter::new(),
             meshcore_parser: FrameParser::new(),
-            meshtastic: MeshtasticHandler::new(node_id),
+            meshtastic,
             rnode: RNodeHandler::new(),
             ble: BleManager::new(),
             stats: Stats::new(),
             identity,
+            wifi,
+            wifi_enabled: false,
+            wifi_protocol: Protocol::Unknown,
+            power,
+            ota,
+            contacts,
             battery: BatteryState::new(),
             led: LedController::new(),
             rx_active: false,
             serial_protocol: Protocol::Unknown,
+            ble_protocol: Protocol::Unknown,
             vext_enabled: true,
             last_battery_check: 0,
             at_buffer: Vec::new(),
@@ -795,7 +620,7 @@ where
             dedup: DeduplicatorRing::new(),
             relay_count: 0,
 
-            session_manager: SessionManager::new(),
+            session_manager,
             onion_router,
             route_builder: RouteBuilder::new(),
             our_address,
@@ -803,7 +628,7 @@ where
     }
 
 
-    fn identity(&self) -> &NodeIdentity {
+    fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
 
@@ -821,7 +646,45 @@ where
 
 
     fn app_connected(&self) -> bool {
-        self.serial_protocol != Protocol::Unknown || self.ble.connection_count() > 0
+        self.serial_protocol != Protocol::Unknown
+            || self.ble_protocol != Protocol::Unknown
+            || self.wifi_protocol != Protocol::Unknown
+            || self.ble.connection_count() > 0
+            || (self.wifi_enabled && self.wifi.status().tcp_client_count > 0)
+    }
+
+
+    fn active_protocol(&self) -> Protocol {
+        if self.serial_protocol != Protocol::Unknown {
+            self.serial_protocol
+        } else if self.ble_protocol != Protocol::Unknown {
+            self.ble_protocol
+        } else if self.wifi_protocol != Protocol::Unknown {
+            self.wifi_protocol
+        } else {
+            self.router.lora_protocol()
+        }
+    }
+
+
+    fn on_protocol_detected(&mut self, protocol: Protocol) {
+        log::info!("Protocol detected: {}", protocol.name());
+        self.configure_radio_for_protocol(protocol);
+        self.stats.protocol_switches += 1;
+
+        match protocol {
+            Protocol::MeshCore => {
+                self.meshcore_parser.feed(0xAA);
+            }
+            Protocol::Meshtastic => {
+                self.meshtastic.feed_serial(0x94);
+            }
+            Protocol::RNode => {}
+            Protocol::AtCommand => {
+                let _ = self.at_buffer.push(b'A');
+            }
+            Protocol::Unknown => {}
+        }
     }
 
 
@@ -831,21 +694,22 @@ where
 
 
     fn reset_protocol(&mut self) {
-        let prev = self.serial_protocol;
+        let prev = self.active_protocol();
         if prev == Protocol::Unknown {
             return;
         }
 
         self.serial_protocol = Protocol::Unknown;
-
+        self.ble_protocol = Protocol::Unknown;
+        self.wifi_protocol = Protocol::Unknown;
 
         self.router.transport(TransportType::UsbSerial).detector.reset();
-
+        self.router.transport(TransportType::Ble).detector.reset();
+        self.router.transport(TransportType::WiFi).detector.reset();
 
         self.meshcore_parser.reset();
         self.meshtastic.reset_parser();
         self.rnode.reset_parser();
-
 
         self.at_buffer.clear();
         self.dedup.clear();
@@ -861,12 +725,7 @@ where
         }
 
 
-        if data.len() >= 4 && &data[..4] == b"TEST" {
-            return false;
-        }
-
-
-        if data.len() < 4 {
+        if !can_relay_lora_packet(data, self.active_protocol()) {
             return false;
         }
 
@@ -876,6 +735,16 @@ where
         }
 
 
+        let relay_data = if self.active_protocol() == Protocol::Meshtastic {
+            match self.meshtastic.prepare_relay_packet(data) {
+                Some(relay) => Some(relay),
+                None => return false,
+            }
+        } else {
+            None
+        };
+        let tx_len = relay_data.as_ref().map(|p| p.len()).unwrap_or(data.len());
+
         let jitter = 20 + ((self.identity.node_id ^ now) % 81);
         let mut waited = 0u32;
         while waited < jitter {
@@ -883,19 +752,40 @@ where
             waited += 1;
         }
 
-
         self.rx_active = false;
-        if self.radio.transmit(data).is_ok() {
+        let transmit_ok = if let Some(ref relay) = relay_data {
+            self.radio.transmit(relay)
+        } else {
+            self.radio.transmit(data)
+        };
+
+        if transmit_ok.is_ok() {
             self.relay_count += 1;
             self.stats.tx_packets += 1;
             self.rx_active = true;
-            log::info!("Relayed packet ({} bytes), total relays: {}", data.len(), self.relay_count);
+            log::info!("Relayed packet ({} bytes), total relays: {}", tx_len, self.relay_count);
             true
         } else {
 
             let _ = self.radio.start_rx(0);
             self.rx_active = true;
             false
+        }
+    }
+
+
+    fn flush_meshtastic_tx(&mut self) {
+        if self.active_protocol() != Protocol::Meshtastic {
+            return;
+        }
+        let now = millis();
+        while let Some(tx) = self.meshtastic.poll_tx(now) {
+            if self.radio.transmit(&tx).is_ok() {
+                self.stats.tx_packets += 1;
+            }
+            if self.radio.start_rx(0).is_ok() {
+                self.rx_active = true;
+            }
         }
     }
 
@@ -986,7 +876,8 @@ where
 
         if cmd.starts_with(b"AT+VERSION") || cmd.starts_with(b"ATI") {
 
-            let _ = uart.write(b"LunarCore v1.0.0\r\n");
+            let _ = uart.write(FIRMWARE_VERSION.as_bytes());
+            let _ = uart.write(b"\r\n");
             let _ = uart.write(b"Unified Mesh Bridge Firmware\r\n");
             let _ = uart.write(b"Protocols: MeshCore, Meshtastic, RNode/KISS\r\n");
             let _ = uart.write(b"OK\r\n");
@@ -1145,6 +1036,85 @@ where
             let _ = uart.write(b"\r\nRelayed: ");
             write_u32(uart, self.relay_count);
             let _ = uart.write(b"\r\nOK\r\n");
+        } else if cmd.starts_with(b"AT+WIFI=") {
+            if cmd.len() > 8 {
+                match cmd[8] {
+                    b'1' => {
+                        self.wifi_enabled = true;
+                        save_wifi_setting(true);
+                        let mut config = WifiConfig::default();
+                        config.mode = WifiMode::Ap;
+                        if self.wifi.init(config).is_ok() {
+                            let _ = uart.write(b"WiFi AP: ON\r\n");
+                            let _ = uart.write(b"OK\r\n");
+                        } else {
+                            let _ = uart.write(b"ERROR\r\n");
+                        }
+                    }
+                    b'0' => {
+                        self.wifi_enabled = false;
+                        save_wifi_setting(false);
+                        self.wifi.stop();
+                        let _ = uart.write(b"WiFi AP: OFF\r\n");
+                        let _ = uart.write(b"OK\r\n");
+                    }
+                    _ => {
+                        let _ = uart.write(b"ERROR: Use 0 or 1\r\n");
+                    }
+                }
+            } else {
+                let _ = uart.write(b"ERROR: Use AT+WIFI=0 or AT+WIFI=1\r\n");
+            }
+        } else if cmd.starts_with(b"AT+WIFI") {
+            let _ = uart.write(b"WiFi: ");
+            if self.wifi_enabled {
+                let _ = uart.write(b"ON, clients: ");
+                write_u32(uart, self.wifi.status().tcp_client_count as u32);
+            } else {
+                let _ = uart.write(b"OFF");
+            }
+            let _ = uart.write(b"\r\nOK\r\n");
+        } else if cmd.starts_with(b"AT+CONTACTS") {
+            let _ = uart.write(b"Contacts: ");
+            write_u32(uart, self.contacts.len() as u32);
+            let _ = uart.write(b"\r\nOK\r\n");
+        } else if cmd.starts_with(b"AT+OTABEGIN") {
+            match self.ota.begin() {
+                Ok(()) => {
+                    let _ = uart.write(b"OTA receive mode\r\nOK\r\n");
+                }
+                Err(_) => {
+                    let _ = uart.write(b"ERROR\r\n");
+                }
+            }
+        } else if cmd.starts_with(b"AT+OTASTATUS") {
+            let _ = uart.write(b"OTA state: ");
+            match self.ota.state() {
+                ota::OtaState::Idle => {
+                    let _ = uart.write(b"Idle\r\n");
+                }
+                ota::OtaState::Receiving => {
+                    let _ = uart.write(b"Receiving\r\n");
+                }
+                ota::OtaState::Complete => {
+                    let _ = uart.write(b"Complete\r\n");
+                }
+                ota::OtaState::Error(_) => {
+                    let _ = uart.write(b"Error\r\n");
+                }
+                _ => {
+                    let _ = uart.write(b"Busy\r\n");
+                }
+            }
+            let _ = uart.write(b"OK\r\n");
+        } else if cmd.starts_with(b"AT+POWER") {
+            let _ = uart.write(b"Power mode: Balanced\r\n");
+            let _ = uart.write(b"Sleep count: ");
+            write_u32(uart, self.power.sleep_count());
+            let _ = uart.write(b"\r\nOK\r\n");
+        } else if cmd.starts_with(b"AT+FACTORYRESET") {
+            self.identity = DeviceIdentity::factory_reset();
+            let _ = uart.write(b"Identity reset\r\nOK\r\n");
         } else if cmd == b"AT" {
 
             let _ = uart.write(b"OK\r\n");
@@ -1165,6 +1135,11 @@ where
             let _ = uart.write(b"  AT+SWITCH   - Reset protocol detection\r\n");
             let _ = uart.write(b"  AT+REPEATER - Repeater status\r\n");
             let _ = uart.write(b"  AT+REPEATER=n - Enable(1)/disable(0)\r\n");
+            let _ = uart.write(b"  AT+WIFI=n    - Enable(1)/disable(0) WiFi AP\r\n");
+            let _ = uart.write(b"  AT+CONTACTS  - Contact count\r\n");
+            let _ = uart.write(b"  AT+OTASTATUS - OTA update status\r\n");
+            let _ = uart.write(b"  AT+POWER     - Power stats\r\n");
+            let _ = uart.write(b"  AT+FACTORYRESET - Reset node identity\r\n");
             let _ = uart.write(b"OK\r\n");
         } else {
             let _ = uart.write(b"ERROR: Unknown command\r\n");
@@ -1172,74 +1147,60 @@ where
     }
 
 
-    fn process_serial_byte(&mut self, byte: u8, uart: &UartDriver) {
-        self.last_serial_rx = millis();
-
-
-        if self.serial_protocol == Protocol::Unknown {
-            if let Some(protocol) = self.router.transport(TransportType::UsbSerial)
-                .detector.feed(byte)
-            {
-                self.serial_protocol = protocol;
-                self.stats.protocol_switches += 1;
-                log::info!("Protocol detected: {}", protocol.name());
-
-
-                self.configure_radio_for_protocol(protocol);
-
-
-                match protocol {
-                    Protocol::MeshCore => {
-
-
-                        self.meshcore_parser.feed(0xAA);
-                    }
-                    Protocol::Meshtastic => {
-
-
-                        self.meshtastic.feed_serial(0x94);
-                    }
-                    Protocol::RNode => {
-
-
-                    }
-                    Protocol::AtCommand => {
-
-
-                        let _ = self.at_buffer.push(b'A');
-                    }
-                    Protocol::Unknown => {}
-                }
-            }
+    fn process_incoming_byte(&mut self, byte: u8, transport: TransportType, uart: &UartDriver) {
+        if transport == TransportType::UsbSerial {
+            self.last_serial_rx = millis();
         }
 
+        let detected = self.router.route_incoming(transport, byte);
 
-        match self.serial_protocol {
+        let needs_detect = match transport {
+            TransportType::UsbSerial => self.serial_protocol == Protocol::Unknown,
+            TransportType::Ble => self.ble_protocol == Protocol::Unknown,
+            TransportType::WiFi => self.wifi_protocol == Protocol::Unknown,
+        };
+
+        if needs_detect && detected != Protocol::Unknown {
+            match transport {
+                TransportType::UsbSerial => self.serial_protocol = detected,
+                TransportType::Ble => self.ble_protocol = detected,
+                TransportType::WiFi => self.wifi_protocol = detected,
+            }
+            self.on_protocol_detected(detected);
+        }
+
+        let protocol = match transport {
+            TransportType::UsbSerial => self.serial_protocol,
+            TransportType::Ble => self.ble_protocol,
+            TransportType::WiFi => self.wifi_protocol,
+        };
+
+        match protocol {
             Protocol::MeshCore => {
                 if let Some(frame) = self.meshcore_parser.feed(byte) {
                     self.handle_meshcore_frame(&frame, uart);
-                    self.router.transport(TransportType::UsbSerial)
-                        .detector.confirm_frame();
+                    self.router.transport(transport).detector.confirm_frame();
                 }
             }
 
             Protocol::Meshtastic => {
                 if let Some(frame) = self.meshtastic.feed_serial(byte) {
                     self.handle_meshtastic_frame(&frame, uart);
-                    self.router.transport(TransportType::UsbSerial)
-                        .detector.confirm_frame();
+                    self.router.transport(transport).detector.confirm_frame();
                 }
             }
 
             Protocol::RNode => {
                 if let Some(frame) = self.rnode.feed_serial(byte) {
                     self.handle_rnode_frame(&frame, uart);
-                    self.router.transport(TransportType::UsbSerial)
-                        .detector.confirm_frame();
+                    self.router.transport(transport).detector.confirm_frame();
                 }
             }
 
             Protocol::AtCommand => {
+                if transport != TransportType::UsbSerial {
+                    return;
+                }
 
                 if byte == b'\r' || byte == b'\n' {
                     if !self.at_buffer.is_empty() {
@@ -1247,15 +1208,17 @@ where
                         self.at_buffer.clear();
                     }
                 } else if byte >= 0x20 && byte < 0x7F {
-
                     let _ = self.at_buffer.push(byte);
                 }
             }
 
-            Protocol::Unknown => {
-
-            }
+            Protocol::Unknown => {}
         }
+    }
+
+
+    fn process_serial_byte(&mut self, byte: u8, uart: &UartDriver) {
+        self.process_incoming_byte(byte, TransportType::UsbSerial, uart);
     }
 
 
@@ -1342,6 +1305,26 @@ where
             }
 
             Command::Transmit => {
+                match self.ota.state() {
+                    ota::OtaState::ReceivingHeader
+                    | ota::OtaState::Receiving
+                    | ota::OtaState::Writing => {
+                        match self.ota.write(&frame.data) {
+                            Ok(_) => {
+                                let response = protocol::build_tx_done(frame.sequence);
+                                self.send_frame(uart, &response);
+                            }
+                            Err(_) => {
+                                if let Some(response) = protocol::build_tx_error(frame.sequence, 10) {
+                                    self.send_frame(uart, &response);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+
                 self.rx_active = false;
                 match self.radio.transmit(&frame.data) {
                     Ok(()) => {
@@ -1556,7 +1539,7 @@ where
 
 
     fn route_rx_packet(&mut self, data: &[u8], rssi: i16, snr: i8, uart: &UartDriver) {
-        match self.serial_protocol {
+        match self.active_protocol() {
             Protocol::MeshCore => {
                 if let Some(frame) = protocol::build_receive(rssi, snr, data) {
                     self.send_frame(uart, &frame);
@@ -1564,17 +1547,23 @@ where
             }
 
             Protocol::Meshtastic => {
-                if let Some(packet) = self.meshtastic.process_lora_packet(data, rssi as i32, snr as f32) {
+                let now = millis();
+                if let Some(packet) = self.meshtastic.process_lora_packet(
+                    data,
+                    rssi as i32,
+                    snr as f32,
+                    now,
+                ) {
                     if let Some(from_radio) = meshtastic::encode_fromradio_packet(&packet) {
-
                         if let Some(serial_frame) = self.meshtastic.build_serial_frame(&from_radio) {
                             let _ = uart.write(&serial_frame);
                         }
 
-
+                        let _ = self.ble.queue_from_radio(&from_radio);
                         let _ = self.ble.notify_from_num(self.meshtastic.rx_count);
                     }
                 }
+
             }
 
             Protocol::RNode => {
@@ -1584,8 +1573,6 @@ where
             }
 
             _ => {
-
-
                 if let Some(frame) = protocol::build_receive(rssi, snr, data) {
                     self.send_frame(uart, &frame);
                 }
@@ -1612,17 +1599,20 @@ where
             None => {
 
 
-                let our_x25519 = crypto::x25519::x25519_base(&self.identity.private_key);
-                let shared = crypto::x25519::x25519(&self.identity.private_key, recipient_public);
+                let shared = crypto::x25519::x25519(
+                    &self.identity.encryption_private,
+                    recipient_public,
+                );
 
                 let params = SessionParams {
                     shared_secret: shared,
-                    our_private: self.identity.private_key,
+                    our_private: self.identity.encryption_private,
                     their_public: *recipient_public,
                     is_initiator: true,
                 };
 
                 self.session_manager.create_session(params);
+                let _ = self.session_manager.save_to_nvs();
 
                 self.session_manager.get_session(recipient_public)
                     .ok_or(CryptoError::SessionError)?
@@ -1978,8 +1968,11 @@ fn main() -> ! {
 
 fn run_lunarcore() -> ! {
 
+    rng::init();
 
-    let identity = NodeIdentity::from_hardware();
+    packet_id::init();
+
+    let identity = DeviceIdentity::from_hardware();
     log::info!("[INIT] Node ID: {:08X}", identity.node_id);
 
 
@@ -2050,7 +2043,20 @@ fn run_lunarcore() -> ! {
 
     let mut lunarcore = LunarCore::new(radio, identity);
     lunarcore.repeater_enabled = load_repeater_setting();
-    log::info!("[INIT] LunarCore OK (repeater: {})", if lunarcore.repeater_enabled { "ON" } else { "OFF" });
+    lunarcore.wifi_enabled = load_wifi_setting();
+    if lunarcore.wifi_enabled {
+        let mut config = WifiConfig::default();
+        config.mode = WifiMode::Ap;
+        match lunarcore.wifi.init(config) {
+            Ok(()) => log::info!("[INIT] WiFi AP OK"),
+            Err(e) => log::error!("[INIT] WiFi FAILED: {:?}", e),
+        }
+    }
+    log::info!(
+        "[INIT] LunarCore OK (repeater: {}, wifi: {})",
+        if lunarcore.repeater_enabled { "ON" } else { "OFF" },
+        if lunarcore.wifi_enabled { "ON" } else { "OFF" },
+    );
 
 
     match lunarcore.ble.init("LunarCore") {
@@ -2117,14 +2123,6 @@ fn run_lunarcore() -> ! {
 
     let mut last_second = 0u32;
     let mut battery_check_interval = 0u32;
-    let mut last_beacon_time = 0u32;
-
-    let beacon_interval = 3000 + (lunarcore.identity.public_key[0] as u32 % 2000);
-
-    let mut beacon_data = [0u8; 8];
-    beacon_data[0..4].copy_from_slice(b"TEST");
-    beacon_data[4..8].copy_from_slice(&lunarcore.identity.public_key[0..4]);
-
 
     let mut current_irq: u16 = 0;
     let mut last_nonzero_irq: u16 = 0;
@@ -2132,24 +2130,10 @@ fn run_lunarcore() -> ! {
     loop {
         let now = millis();
 
-
-        if !lunarcore.app_connected() && now.wrapping_sub(last_beacon_time) >= beacon_interval {
-            last_beacon_time = now;
-
-            lunarcore.rx_active = false;
-            if lunarcore.radio.transmit(&beacon_data).is_ok() {
-                lunarcore.stats.tx_packets += 1;
-
-                lunarcore.rx_active = true;
-            }
-        }
-
-
         feed_watchdog();
 
-
         lunarcore.process_radio_events(&uart);
-
+        lunarcore.flush_meshtastic_tx();
 
         let mut byte = [0u8; 1];
         while uart.read(&mut byte, 0).unwrap_or(0) > 0 {
@@ -2157,48 +2141,35 @@ fn run_lunarcore() -> ! {
             LAST_ACTIVITY.store(now, Ordering::Relaxed);
         }
 
+        while let Some(packet) = lunarcore.ble.read_with_service() {
+            for &b in &packet.data {
+                lunarcore.process_incoming_byte(b, TransportType::Ble, &uart);
+                LAST_ACTIVITY.store(now, Ordering::Relaxed);
+            }
+        }
+        let _ = lunarcore.ble.process_tx();
+
+        if lunarcore.wifi_enabled {
+            if let Some((_client_idx, data)) = lunarcore.wifi.poll() {
+                for &b in &data {
+                    lunarcore.process_incoming_byte(b, TransportType::WiFi, &uart);
+                    LAST_ACTIVITY.store(now, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if lunarcore.repeater_active()
+            && !lunarcore.app_connected()
+            && lunarcore.battery.is_low
+            && now % 5000 < 10
+        {
+            let _ = lunarcore.power.set_mode(PowerMode::LowPower);
+        }
 
         if let Ok(irq) = lunarcore.radio.get_irq_status() {
             current_irq = irq;
             if irq != 0 {
                 last_nonzero_irq = irq;
-            }
-
-
-            if irq != 0 {
-
-                if irq & 0x40 != 0 {
-                    lunarcore.stats.rx_errors += 1;
-                }
-
-
-                if (irq & 0x02 != 0) && (irq & 0x40 == 0) {
-                    match lunarcore.radio.read_packet() {
-                        Ok((data, rssi, snr)) => {
-                            lunarcore.stats.rx_packets += 1;
-                            lunarcore.stats.last_rssi = rssi;
-                            lunarcore.route_rx_packet(&data, rssi, snr, &uart);
-
-                            if lunarcore.maybe_relay_packet(&data, now) {
-                                lunarcore.led.flash(3);
-                            } else {
-                                lunarcore.led.flash(2);
-                            }
-                        }
-                        Err(_) => {
-                            lunarcore.stats.rx_errors += 1;
-                        }
-                    }
-                }
-
-
-                let _ = lunarcore.radio.clear_irq(irq);
-
-
-                if (irq & 0x01 != 0) || (irq & 0x02 != 0) {
-                    let _ = lunarcore.radio.start_rx(0);
-                    lunarcore.rx_active = true;
-                }
             }
         }
 
@@ -2226,6 +2197,7 @@ fn run_lunarcore() -> ! {
 
             if lunarcore.serial_protocol != Protocol::Unknown
                 && ble_now == 0
+                && lunarcore.ble_protocol == Protocol::Unknown
                 && lunarcore.last_serial_rx > 0
                 && now.wrapping_sub(lunarcore.last_serial_rx) > 30_000
             {
@@ -2233,8 +2205,8 @@ fn run_lunarcore() -> ! {
                 lunarcore.reset_protocol();
             }
 
-
             if lunarcore.prev_ble_connections > 0 && ble_now == 0
+                && lunarcore.ble_protocol != Protocol::Unknown
                 && (lunarcore.last_serial_rx == 0
                     || now.wrapping_sub(lunarcore.last_serial_rx) > 5_000)
             {
@@ -2253,7 +2225,7 @@ fn run_lunarcore() -> ! {
 
 
             if current_second % 2 == 0 {
-                let protocol_name = match lunarcore.serial_protocol {
+                let protocol_name = match lunarcore.active_protocol() {
                     Protocol::MeshCore => "MeshCore",
                     Protocol::Meshtastic => "Meshtastic",
                     Protocol::RNode => "RNode/KISS",
@@ -2272,7 +2244,7 @@ fn run_lunarcore() -> ! {
                     rx_count: lunarcore.stats.rx_packets,
                     tx_count: lunarcore.stats.tx_packets,
                     rssi: lunarcore.stats.last_rssi,
-                    connected: lunarcore.serial_protocol != Protocol::Unknown,
+                    connected: lunarcore.app_connected(),
                     irq_status: current_irq,
                     last_irq: last_nonzero_irq,
                     dio1_count: DIO1_COUNT.load(Ordering::Relaxed),
