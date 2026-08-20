@@ -586,11 +586,14 @@ where
         let mut power = PowerManager::new();
         let _ = power.init();
 
+        let mut meshtastic = MeshtasticHandler::new(node_id);
+        meshtastic.set_device_keys(&identity.encryption_private, &identity.encryption_public);
+
         Self {
             radio,
             router: ProtocolRouter::new(),
             meshcore_parser: FrameParser::new(),
-            meshtastic: MeshtasticHandler::new(node_id),
+            meshtastic,
             rnode: RNodeHandler::new(),
             ble: BleManager::new(),
             stats: Stats::new(),
@@ -731,6 +734,13 @@ where
         }
 
 
+        let relay_data = if self.active_protocol() == Protocol::Meshtastic {
+            self.meshtastic.prepare_relay_packet(data)
+        } else {
+            None
+        };
+        let tx_len = relay_data.as_ref().map(|p| p.len()).unwrap_or(data.len());
+
         let jitter = 20 + ((self.identity.node_id ^ now) % 81);
         let mut waited = 0u32;
         while waited < jitter {
@@ -738,13 +748,18 @@ where
             waited += 1;
         }
 
-
         self.rx_active = false;
-        if self.radio.transmit(data).is_ok() {
+        let transmit_ok = if let Some(ref relay) = relay_data {
+            self.radio.transmit(relay)
+        } else {
+            self.radio.transmit(data)
+        };
+
+        if transmit_ok.is_ok() {
             self.relay_count += 1;
             self.stats.tx_packets += 1;
             self.rx_active = true;
-            log::info!("Relayed packet ({} bytes), total relays: {}", data.len(), self.relay_count);
+            log::info!("Relayed packet ({} bytes), total relays: {}", tx_len, self.relay_count);
             true
         } else {
 

@@ -57,6 +57,7 @@ mod user_fields {
     pub const HW_MODEL: u32 = 5;
     pub const IS_LICENSED: u32 = 6;
     pub const ROLE: u32 = 7;
+    pub const PUBLIC_KEY: u32 = 8;
 }
 
 
@@ -546,6 +547,9 @@ pub fn encode_user(user: &User) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
     encoder.write_varint_field(user_fields::HW_MODEL, user.hw_model as u64);
     encoder.write_bool_field(user_fields::IS_LICENSED, user.is_licensed);
     encoder.write_varint_field(user_fields::ROLE, user.role as u64);
+    if let Some(pk) = user.public_key {
+        encoder.write_bytes_field(user_fields::PUBLIC_KEY, &pk);
+    }
 
     Some(encoder.finish())
 }
@@ -680,6 +684,7 @@ pub fn decode_user(data: &[u8]) -> Option<User> {
         hw_model: HardwareModel::Unset,
         is_licensed: false,
         role: Role::Client,
+        public_key: None,
     };
 
     while decoder.has_more() {
@@ -740,6 +745,14 @@ pub fn decode_user(data: &[u8]) -> Option<User> {
                     10 => Role::TakTracker,
                     _ => Role::Client,
                 };
+            }
+            user_fields::PUBLIC_KEY if wire_type == WIRE_TYPE_LENGTH_DELIMITED => {
+                let bytes = decoder.read_bytes()?;
+                if bytes.len() == 32 {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(bytes);
+                    result.public_key = Some(pk);
+                }
             }
             _ => {
                 if !decoder.skip_field(wire_type) {

@@ -105,6 +105,29 @@ pub fn channel_hash(name: &str, key_bytes: &[u8]) -> u8 {
 }
 
 
+pub fn match_default_preset_key(hash: u8) -> Option<ChannelKey> {
+    const PRESETS: [ModemPreset; 9] = [
+        ModemPreset::LongSlow,
+        ModemPreset::LongFast,
+        ModemPreset::LongModerate,
+        ModemPreset::VeryLongSlow,
+        ModemPreset::MediumSlow,
+        ModemPreset::MediumFast,
+        ModemPreset::ShortSlow,
+        ModemPreset::ShortFast,
+        ModemPreset::ShortTurbo,
+    ];
+
+    for preset in PRESETS {
+        let name = modem_preset_display_name(preset);
+        if channel_hash(name, mesh_kdf::DEFAULT_KEY.as_slice()) == hash {
+            return Some(ChannelKey::default_key());
+        }
+    }
+    None
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ModemPreset {
@@ -708,6 +731,12 @@ mod tests {
             }
             _ => panic!("Expected AES-256 key"),
         }
+    }
+
+    #[test]
+    fn test_match_default_preset_longfast() {
+        assert!(match_default_preset_key(8).is_some());
+        assert!(match_default_preset_key(0xFF).is_none());
     }
 
     #[test]

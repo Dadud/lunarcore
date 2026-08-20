@@ -513,7 +513,7 @@ pub fn can_relay_lora_packet(data: &[u8], protocol: Protocol) -> bool {
             if data.len() < 16 {
                 return false;
             }
-            let hop_limit = (data[12] & 0x0E) >> 1;
+            let hop_limit = data[12] & 0x07;
             hop_limit > 0
         }
         Protocol::MeshCore => {

@@ -2,11 +2,13 @@ pub mod protobuf;
 pub mod channel;
 pub mod packet;
 pub mod encryption;
+pub mod node_db;
 
 pub use protobuf::*;
 pub use channel::*;
 pub use packet::*;
 pub use encryption::*;
+pub use node_db::*;
 
 use heapless::Vec;
 
@@ -105,6 +107,8 @@ pub struct MeshPacket {
 
     pub want_ack: bool,
 
+    pub pki_encrypted: bool,
+
     pub via_mqtt: bool,
 
     pub next_hop: u8,
@@ -189,6 +193,7 @@ impl Default for MeshPacket {
             hop_limit: DEFAULT_HOP_LIMIT,
             hop_start: DEFAULT_HOP_LIMIT,
             want_ack: false,
+            pki_encrypted: false,
             via_mqtt: false,
             next_hop: 0,
             relay_node: 0,
@@ -246,6 +251,8 @@ pub struct User {
     pub is_licensed: bool,
 
     pub role: Role,
+
+    pub public_key: Option<[u8; 32]>,
 }
 
 
@@ -392,6 +399,10 @@ pub struct MeshtasticHandler {
     config_request_id: u32,
 
     config_channel_index: u8,
+
+    node_db: NodeDb,
+
+    local_privkey: Option<[u8; 32]>,
 }
 
 impl MeshtasticHandler {
@@ -410,7 +421,20 @@ impl MeshtasticHandler {
             pending_responses: heapless::Deque::new(),
             config_request_id: 0,
             config_channel_index: 0,
+            node_db: NodeDb::new(),
+            local_privkey: None,
         }
+    }
+
+
+    pub fn set_device_keys(&mut self, privkey: &[u8; 32], pubkey: &[u8; 32]) {
+        self.local_privkey = Some(*privkey);
+        self.node_db.set_public_key(self.node_id, *pubkey);
+    }
+
+
+    pub fn prepare_relay_packet(&self, data: &[u8]) -> Option<Vec<u8, 256>> {
+        packet::prepare_relay_packet(data, self.node_id)
     }
 
 
@@ -458,19 +482,113 @@ impl MeshtasticHandler {
     }
 
 
-    fn decrypt_packet(&self, packet: &MeshPacket) -> Option<MeshPacket> {
-        let mut result = packet.clone();
+    fn into_lora_payload(data: &[u8]) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
+        if data.len() > MAX_LORA_PAYLOAD {
+            return None;
+        }
+        Vec::from_slice(data).ok()
+    }
 
-        if let PacketPayload::Encrypted(ref encrypted) = packet.payload {
-            let channel = self.find_channel_by_hash(packet.channel_hash)?;
-            let decrypted = channel.decrypt(packet.id, packet.from, encrypted)?;
+
+    fn decrypt_with_channel(&self, channel: &Channel, packet: &MeshPacket, ciphertext: &[u8]) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
+        let plaintext = channel.decrypt(packet.id, packet.from, ciphertext)?;
+        let payload = Self::into_lora_payload(&plaintext)?;
+        if protobuf::decode_data(&payload).is_some() {
+            Some(payload)
+        } else {
+            None
+        }
+    }
 
 
-            if let Some(data) = protobuf::decode_data(&decrypted) {
-                result.payload = PacketPayload::Decoded(data);
+    fn try_channel_decrypt(&self, packet: &MeshPacket, ciphertext: &[u8]) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
+        if let Some(channel) = self.find_channel_by_hash(packet.channel_hash) {
+            if let Some(plaintext) = self.decrypt_with_channel(channel, packet, ciphertext) {
+                return Some(plaintext);
             }
         }
 
+        if let Some(key) = channel::match_default_preset_key(packet.channel_hash) {
+            let temp = Channel {
+                index: 0,
+                name: Vec::new(),
+                key,
+                modem_preset: ModemPreset::LongFast,
+                uplink_enabled: false,
+                downlink_enabled: false,
+                position_precision: 0,
+            };
+            if let Some(plaintext) = self.decrypt_with_channel(&temp, packet, ciphertext) {
+                return Some(plaintext);
+            }
+        }
+
+        None
+    }
+
+
+    fn try_pki_decrypt(&self, packet: &MeshPacket, ciphertext: &[u8]) -> Option<Vec<u8, MAX_LORA_PAYLOAD>> {
+        if packet.to != self.node_id {
+            return None;
+        }
+        if ciphertext.len() < PKI_OVERHEAD {
+            return None;
+        }
+
+        let sender_pubkey = self.node_db.get_public_key(packet.from)?;
+        let privkey = self.local_privkey.as_ref()?;
+        let mut decrypted = pki_decrypt(
+            privkey,
+            sender_pubkey,
+            ciphertext,
+            packet.id,
+            packet.from,
+        )?;
+        let payload = Self::into_lora_payload(&decrypted)?;
+        if protobuf::decode_data(&payload).is_some() {
+            Some(payload)
+        } else {
+            None
+        }
+    }
+
+
+    fn ingest_decoded_packet(&mut self, packet: &MeshPacket) {
+        if let PacketPayload::Decoded(ref data) = packet.payload {
+            if data.port == PortNum::NodeInfo {
+                if let Some(user) = protobuf::decode_user(&data.payload) {
+                    if let Some(pk) = user.public_key {
+                        self.node_db.set_public_key(packet.from, pk);
+                    }
+                }
+            }
+        }
+    }
+
+
+    fn decrypt_packet(&mut self, packet: &MeshPacket) -> Option<MeshPacket> {
+        let mut result = packet.clone();
+
+        if let PacketPayload::Encrypted(ref encrypted) = packet.payload {
+            let (plaintext, pki_encrypted) =
+                if let Some(plaintext) = self.try_pki_decrypt(packet, encrypted) {
+                    (plaintext, true)
+                } else if let Some(plaintext) = self.try_channel_decrypt(packet, encrypted) {
+                    (plaintext, false)
+                } else {
+                    return None;
+                };
+
+            result.pki_encrypted = pki_encrypted;
+
+            if let Some(data) = protobuf::decode_data(&plaintext) {
+                result.payload = PacketPayload::Decoded(data);
+            } else {
+                return None;
+            }
+        }
+
+        self.ingest_decoded_packet(&result);
         Some(result)
     }
 
@@ -497,11 +615,30 @@ impl MeshtasticHandler {
 
         let encoded = protobuf::encode_data(&data)?;
 
-
-        let encrypted = self.primary_channel.encrypt(packet_id, self.node_id, &encoded)?;
-
-
         let channel_hash = self.primary_channel.hash();
+        let encrypted = if to != 0xFFFFFFFF && to != self.node_id {
+            if let (Some(recipient_pub), Some(sender_priv)) = (
+                self.node_db.get_public_key(to),
+                self.local_privkey.as_ref(),
+            ) {
+                let mut extra_nonce_bytes = [0u8; 4];
+                crate::rng::fill_random(&mut extra_nonce_bytes);
+                let extra_nonce = u32::from_le_bytes(extra_nonce_bytes);
+                pki_encrypt(
+                    recipient_pub,
+                    sender_priv,
+                    &encoded,
+                    packet_id,
+                    self.node_id,
+                    extra_nonce,
+                )
+                .or_else(|| self.primary_channel.encrypt(packet_id, self.node_id, &encoded))
+            } else {
+                self.primary_channel.encrypt(packet_id, self.node_id, &encoded)
+            }
+        } else {
+            self.primary_channel.encrypt(packet_id, self.node_id, &encoded)
+        }?;
 
         let lora_packet = packet::build_lora_packet(
             self.node_id,
@@ -925,6 +1062,12 @@ impl MeshtasticHandler {
 
         let _ = write_tag(7, WIRE_VARINT, &mut user);
         let _ = encode_varint(4, &mut user);
+
+        if let Some(pk) = self.node_db.get_public_key(self.node_id) {
+            let _ = write_tag(8, WIRE_LEN, &mut user);
+            let _ = encode_varint(pk.len() as u64, &mut user);
+            let _ = user.extend_from_slice(pk);
+        }
 
 
         let _ = write_tag(2, WIRE_LEN, &mut node_info);

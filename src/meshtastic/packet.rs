@@ -50,6 +50,7 @@ pub fn parse_lora_packet(data: &[u8]) -> Option<MeshPacket> {
         hop_limit,
         hop_start,
         want_ack,
+        pki_encrypted: false,
         via_mqtt,
         next_hop: if hop_start == 0 { 0 } else { next_hop },
         relay_node: if hop_start == 0 { 0 } else { relay_node },
@@ -193,6 +194,42 @@ pub fn route_packet(packet: &MeshPacket, our_node_id: u32, cache: &mut PacketCac
     } else {
         RoutingDecision::Drop
     }
+}
+
+
+pub fn prepare_relay_packet(data: &[u8], our_node_id: u32) -> Option<Vec<u8, 256>> {
+    let packet = parse_lora_packet(data)?;
+    if packet.hop_limit == 0 {
+        return None;
+    }
+
+    let payload = match &packet.payload {
+        PacketPayload::Encrypted(payload) => payload.as_slice(),
+        PacketPayload::Decoded(_) => return None,
+    };
+
+    build_lora_packet(
+        packet.from,
+        packet.to,
+        packet.id,
+        packet.channel_hash,
+        packet.hop_limit - 1,
+        packet.hop_start,
+        packet.want_ack,
+        packet.via_mqtt,
+        packet.next_hop,
+        (our_node_id & 0xFF) as u8,
+        payload,
+    )
+}
+
+
+pub fn can_relay_packet(data: &[u8]) -> bool {
+    if data.len() < LORA_HEADER_SIZE {
+        return false;
+    }
+    let hop_limit = data[OFFSET_FLAGS] & FLAG_HOP_LIMIT_MASK;
+    hop_limit > 0
 }
 
 
@@ -521,5 +558,29 @@ mod tests {
 
         assert!(tracker.handle_ack(0xABCD, 0x1234));
         assert!(!tracker.is_pending(0xABCD, 0x1234));
+    }
+
+    #[test]
+    fn test_prepare_relay_decrements_hop() {
+        let payload = [0xAAu8; 8];
+        let original = build_lora_packet(
+            0x11111111,
+            0xFFFFFFFF,
+            0x22222222,
+            8,
+            3,
+            3,
+            false,
+            false,
+            0,
+            0,
+            &payload,
+        )
+        .unwrap();
+
+        let relay = prepare_relay_packet(&original, 0x12345678).unwrap();
+        let parsed = parse_lora_packet(&relay).unwrap();
+        assert_eq!(parsed.hop_limit, 2);
+        assert_eq!(parsed.relay_node, 0x78);
     }
 }
