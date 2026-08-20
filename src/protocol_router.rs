@@ -503,6 +503,37 @@ impl LoRaPacket {
 }
 
 
+pub fn can_relay_lora_packet(data: &[u8], protocol: Protocol) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+
+    if &data[..4] == b"TEST" {
+        return false;
+    }
+
+    match protocol {
+        Protocol::Meshtastic => {
+            if data.len() < 16 {
+                return false;
+            }
+            let hop_limit = (data[12] & 0x0E) >> 1;
+            hop_limit > 0
+        }
+        Protocol::MeshCore => {
+            if data.len() < 9 {
+                return false;
+            }
+            let hop = (data[8] >> 4) & 0x0F;
+            hop > 0 && hop <= 7
+        }
+        Protocol::RNode => data.len() >= 18,
+        Protocol::Unknown => data.len() >= 8,
+        Protocol::AtCommand => false,
+    }
+}
+
+
 #[derive(Clone)]
 pub struct UnifiedPacket {
 

@@ -30,7 +30,6 @@ pub fn parse_lora_packet(data: &[u8]) -> Option<MeshPacket> {
     let flags = data[OFFSET_FLAGS];
     let channel_hash = data[OFFSET_CHANNEL_HASH];
 
-
     let want_ack = (flags & FLAG_WANT_ACK) != 0;
     let hop_limit = (flags & FLAG_HOP_LIMIT_MASK) >> FLAG_HOP_LIMIT_SHIFT;
     let channel = (flags & FLAG_CHANNEL_MASK) >> FLAG_CHANNEL_SHIFT;
@@ -58,6 +57,7 @@ pub fn parse_lora_packet(data: &[u8]) -> Option<MeshPacket> {
         from,
         to,
         channel,
+        channel_hash,
         id,
         hop_limit,
         want_ack,
@@ -70,11 +70,21 @@ pub fn parse_lora_packet(data: &[u8]) -> Option<MeshPacket> {
 }
 
 
+pub fn xor_channel_hash(key: &[u8]) -> u8 {
+    let mut h: u8 = 0;
+    for &b in key {
+        h ^= b;
+    }
+    h
+}
+
+
 pub fn build_lora_packet(
     from: u32,
     to: u32,
     id: u32,
-    channel: u8,
+    channel_index: u8,
+    channel_hash: u8,
     hop_limit: u8,
     want_ack: bool,
     payload: &[u8],
@@ -94,11 +104,11 @@ pub fn build_lora_packet(
 
     let flags = (if want_ack { FLAG_WANT_ACK } else { 0 })
         | ((hop_limit & 0x07) << FLAG_HOP_LIMIT_SHIFT)
-        | ((channel & 0x0F) << FLAG_CHANNEL_SHIFT);
+        | ((channel_index & 0x0F) << FLAG_CHANNEL_SHIFT);
     packet.push(flags).ok()?;
 
 
-    packet.push(compute_channel_hash(channel)).ok()?;
+    packet.push(channel_hash).ok()?;
 
 
     packet.push(0).ok()?;
@@ -120,15 +130,6 @@ fn compute_mic(data: &[u8]) -> [u8; MIC_SIZE] {
     let mut mic = [0u8; MIC_SIZE];
     mic.copy_from_slice(&hash[..MIC_SIZE]);
     mic
-}
-
-
-fn compute_channel_hash(channel: u8) -> u8 {
-
-
-    let mut h = channel.wrapping_mul(0x9E).wrapping_add(0x37);
-    h ^= h >> 4;
-    h.wrapping_mul(0xB5)
 }
 
 
@@ -250,6 +251,7 @@ pub fn create_forward_packet(original: &MeshPacket, payload: &[u8]) -> Option<Ve
         original.to,
         original.id,
         original.channel,
+        original.channel_hash,
         original.hop_limit - 1,
         original.want_ack,
         payload,
@@ -443,7 +445,8 @@ mod tests {
         let want_ack = true;
         let payload = [0x01, 0x02, 0x03, 0x04, 0x05];
 
-        let packet = build_lora_packet(from, to, id, channel, hop_limit, want_ack, &payload).unwrap();
+        let channel_hash = xor_channel_hash(b"");
+        let packet = build_lora_packet(from, to, id, channel, channel_hash, hop_limit, want_ack, &payload).unwrap();
 
         let parsed = parse_lora_packet(&packet).unwrap();
         assert_eq!(parsed.from, from);

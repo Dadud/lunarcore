@@ -95,6 +95,8 @@ pub struct MeshPacket {
 
     pub channel: u8,
 
+    pub channel_hash: u8,
+
     pub id: u32,
 
     pub hop_limit: u8,
@@ -174,6 +176,7 @@ impl Default for MeshPacket {
             from: 0,
             to: 0xFFFFFFFF,
             channel: 0,
+            channel_hash: 0,
             id: 0,
             hop_limit: DEFAULT_HOP_LIMIT,
             want_ack: false,
@@ -405,11 +408,7 @@ impl MeshtasticHandler {
 
 
     pub fn next_packet_id(&mut self) -> u32 {
-        self.last_packet_id = self.last_packet_id.wrapping_add(1);
-        if self.last_packet_id == 0 {
-            self.last_packet_id = 1;
-        }
-        self.last_packet_id
+        crate::packet_id::next_packet_id()
     }
 
 
@@ -486,11 +485,14 @@ impl MeshtasticHandler {
         let encrypted = self.primary_channel.encrypt(packet_id, self.node_id, &encoded)?;
 
 
+        let channel_hash = self.primary_channel.hash();
+
         let lora_packet = packet::build_lora_packet(
             self.node_id,
             to,
             packet_id,
             0,
+            channel_hash,
             DEFAULT_HOP_LIMIT,
             want_ack,
             &encrypted,

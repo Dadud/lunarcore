@@ -420,8 +420,11 @@ impl TcpClient {
     }
 
 
-    pub fn is_authenticated(&self) -> bool {
-        self.auth_state == AuthState::Authenticated || self.auth_state == AuthState::None
+    pub fn is_authenticated(&self, require_auth: bool) -> bool {
+        if !require_auth {
+            return true;
+        }
+        self.auth_state == AuthState::Authenticated
     }
 
 
@@ -533,6 +536,79 @@ impl WifiManager {
 
     pub fn is_auth_configured(&self) -> bool {
         !self.config.security.require_auth || self.config.security.is_psk_set()
+    }
+
+
+    pub fn configure_device_psk(&mut self, mac: &[u8; 6]) {
+        let mut input = [0u8; 38];
+        input[..6].copy_from_slice(mac);
+        input[6..].copy_from_slice(b"LunarCore WiFi PSK v1");
+        let psk = Sha256::hash(&input);
+        self.set_psk(&psk);
+    }
+
+
+    fn begin_client_auth(&mut self, idx: usize) {
+        let require_auth = self.config.security.require_auth;
+        if !require_auth {
+            self.clients[idx].auth_state = AuthState::Authenticated;
+            self.clients[idx].state = TcpClientState::Connected;
+            return;
+        }
+
+        let mut challenge = [0u8; AUTH_CHALLENGE_SIZE];
+        crate::rng::fill_random(&mut challenge);
+        self.clients[idx].auth_challenge = challenge;
+        self.clients[idx].auth_state = AuthState::ChallengeSent;
+        self.clients[idx].state = TcpClientState::Authenticating;
+
+        let mut msg: Vec<u8, 64> = Vec::new();
+        let _ = msg.push(0x01);
+        for &b in &challenge {
+            let _ = msg.push(b);
+        }
+        let _ = self.send_to_client(idx, &msg);
+    }
+
+
+    fn process_client_auth(&mut self, idx: usize, data: &[u8]) -> Option<Vec<u8, TCP_RX_BUFFER_SIZE>> {
+        let require_auth = self.config.security.require_auth;
+        if !require_auth || self.clients[idx].auth_state == AuthState::Authenticated {
+            let mut out = Vec::new();
+            for &b in data {
+                let _ = out.push(b);
+            }
+            return Some(out);
+        }
+
+        if self.clients[idx].auth_state == AuthState::ChallengeSent && data.len() >= AUTH_RESPONSE_SIZE {
+            let mut response = [0u8; AUTH_RESPONSE_SIZE];
+            response.copy_from_slice(&data[..AUTH_RESPONSE_SIZE]);
+            let expected = hmac_sha256(&self.config.security.psk, &self.clients[idx].auth_challenge);
+            if ct_eq_32(&response, &expected) {
+                self.clients[idx].auth_state = AuthState::Authenticated;
+                self.clients[idx].state = TcpClientState::Connected;
+
+                let mut session_key = hmac_sha256(&self.config.security.psk, b"LunarCore TCP v1");
+                let mut session_nonce = [0u8; SESSION_NONCE_SIZE];
+                crate::rng::fill_random(&mut session_nonce);
+                self.clients[idx].session.init(&session_key, &session_nonce);
+
+                if data.len() > AUTH_RESPONSE_SIZE {
+                    let mut out = Vec::new();
+                    for &b in &data[AUTH_RESPONSE_SIZE..] {
+                        let _ = out.push(b);
+                    }
+                    return Some(out);
+                }
+                return None;
+            }
+
+            self.clients[idx].auth_state = AuthState::Failed;
+            self.disconnect_client(idx);
+        }
+
+        None
     }
 
 
@@ -807,7 +883,7 @@ impl WifiManager {
 
             if client_fd >= 0 {
 
-                for client in &mut self.clients {
+                for (idx, client) in self.clients.iter_mut().enumerate() {
                     if client.is_available() {
 
                         let flags = esp_idf_sys::lwip_fcntl(client_fd, esp_idf_sys::F_GETFL as i32, 0);
@@ -816,13 +892,12 @@ impl WifiManager {
                         client.fd = client_fd;
                         client.state = TcpClientState::Detecting;
 
-
-                        let ip_bytes = client_addr.sin_addr.s_addr.to_le_bytes();
-                        let ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                        let ip = Ipv4Addr::from_bits(u32::from_be(client_addr.sin_addr.s_addr));
                         let port = u16::from_be(client_addr.sin_port);
                         client.addr = SocketAddrV4::new(ip, port);
 
                         self.status.tcp_client_count += 1;
+                        self.begin_client_auth(idx);
                         return;
                     }
                 }
@@ -851,11 +926,11 @@ impl WifiManager {
             );
 
             if n > 0 {
-                let mut data = Vec::new();
-                for &b in &buf[..n as usize] {
-                    let _ = data.push(b);
+                let payload = &buf[..n as usize];
+                if let Some(data) = self.process_client_auth(idx, payload) {
+                    return Some(data);
                 }
-                return Some(data);
+                return None;
             } else if n == 0 {
 
                 self.disconnect_client(idx);
@@ -1168,19 +1243,19 @@ mod tests {
         let mut client = TcpClient::empty();
 
 
-        assert!(client.is_authenticated());
+        assert!(client.is_authenticated(false));
 
 
         client.auth_state = AuthState::ChallengeSent;
-        assert!(!client.is_authenticated());
+        assert!(!client.is_authenticated(true));
 
 
         client.auth_state = AuthState::Authenticated;
-        assert!(client.is_authenticated());
+        assert!(client.is_authenticated(true));
 
 
         client.auth_state = AuthState::Failed;
-        assert!(!client.is_authenticated());
+        assert!(!client.is_authenticated(true));
     }
 
     #[test]
